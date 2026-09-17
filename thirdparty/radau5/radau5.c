@@ -303,7 +303,7 @@ static int _radcor(radau_mem_t *rmem, int n, FP_CB_f fcn, void *fcn_EXT,
 	double ysafe; /* auxiliary value in jacobians*/
 
 	/* tracking for various failure states */
-	int nunexpect; /* number of unexpected step failures, max = 10 */
+	int nunexpect; /* number of consecutive unexpected (recoverable callback) step failures, max = 10 */
 	int nsing; /* number of singular jacobians */
 
     /* Parameter adjustments */
@@ -598,6 +598,7 @@ L40:
 	/* --- STEP IS ACCEPTED */
 		first = FALSE_;
 		rmem->stats->naccpt++;
+		nunexpect = 0; /* limit applies to consecutive recoverable callback failures, not to the whole call */
 		if (rmem->input->pred_step_control) {
 			/*       --- PREDICTIVE CONTROLLER OF GUSTAFSSON */
 			if (rmem->stats->naccpt > 1) {
