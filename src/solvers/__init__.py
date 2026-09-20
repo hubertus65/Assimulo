@@ -43,6 +43,10 @@ try:
 except ImportError as ie:
     sys.stderr.write("Could not find " + str(ie) + "\n")
 try:
+    from .arkode import ARKODE
+except ImportError as ie:
+    sys.stderr.write("Could not find " + str(ie) + "\n")
+try:
     from .kinsol import KINSOL
 except ImportError as ie:
     sys.stderr.write("Could not find " + str(ie) + "\n")

@@ -28,6 +28,17 @@ if have_sundials
     depend_files: core_pxd + sundials_pxi)
   py.extension_module('sundials', sundials_c, include_directories: sundials_incs, c_args: cython_c_flags,
     dependencies: sundials_deps, install: true, subdir: pkg / 'solvers')
+  # ARKODE (stepper-independent API: SUNDIALS >= 7.1)
+  if fs.exists(sundials_incdir / 'arkode' / 'arkode.h') and (sundials_version[0].to_int() > 7 or (sundials_version[0].to_int() == 7 and sundials_version[1].to_int() >= 1))
+    arkode_deps = sundials_deps + [cc.find_library('sundials_arkode', dirs: [sundials_libdir])]
+    arkode_c = custom_target('arkode_cython', input: stage['solvers/arkode.pyx'], output: 'arkode.c',
+      command: cythonize + ['@INPUT@', '@OUTPUT@', '-m', pkg + '.solvers.arkode'] + cython_inc + sundials_cython_env,
+      depend_files: core_pxd + sundials_pxi + arkode_pxd)
+    py.extension_module('arkode', arkode_c, include_directories: sundials_incs, c_args: cython_c_flags,
+      dependencies: arkode_deps, install: true, subdir: pkg / 'solvers')
+  else
+    message('ARKODE not built: needs SUNDIALS >= 7.1 with arkode/arkode.h')
+  endif
   kinsol_c = custom_target('kinsol_cython', input: stage['solvers/kinsol.pyx'], output: 'kinsol.c',
     command: cythonize + ['@INPUT@', '@OUTPUT@', '-m', pkg + '.solvers.kinsol'] + cython_inc + sundials_cython_env,
     depend_files: core_pxd + sundials_pxi)
