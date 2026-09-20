@@ -40,6 +40,7 @@ cdef int cv_rhs(realtype t, N_Vector yv, N_Vector yvdot, void* problem_data) noe
             else:
                 rhs = (<object>pData.RHS)(t,y,p)
         except Exception:
+            pData.nrhsfails += 1
             return CV_REC_ERR #Recoverable Error (See Sundials description)
         except BaseException:
             return CV_UNREC_RHSFUNC_ERR
@@ -51,6 +52,7 @@ cdef int cv_rhs(realtype t, N_Vector yv, N_Vector yvdot, void* problem_data) noe
             else:
                 rhs = (<object>pData.RHS)(t,y)
         except Exception:
+            pData.nrhsfails += 1
             return CV_REC_ERR #Recoverable Error (See Sundials description)
         except BaseException:
             return CV_UNREC_RHSFUNC_ERR
@@ -840,6 +842,7 @@ cdef class ProblemData:
         int memSizeRoot    #dimRoot*sizeof(realtype) used when copying memory
         int memSizeJac     #dim*dim*sizeof(realtype) used when copying memory
         int verbose        #Defines the verbosity
+        long int nrhsfails #Number of recoverable failures returned by the rhs callback (an exception in the problem's rhs)
         object PREC_DATA   #Arbitrary data from the preconditioner
         np.ndarray work_y
         np.ndarray work_yd

@@ -90,8 +90,9 @@ cdef class ARKODE(Explicit_ODE):
     cdef dict _last_counters        # ARKODE's cumulative counters at the last store_statistics
     cdef int _fresh_memory          # the memory block was just created: the method-defining options are still to be set
     cdef object _active_table       # the table in use: options['table'] or, after a fallback, options['fallback_table']
-    cdef long int _fb_attempts0, _fb_fails0   # counters at the start of the current failure-rate window
+    cdef long int _fb_attempts0, _fb_fails0, _fb_rhsfails0   # counters at the start of the current failure-rate window
     cdef public object fallback_time  # time of the fallback to the 2-stage table, None if it did not happen
+    cdef public object fallback_return_time   # time of the switch back to the user's table after a hard failure of the fallback
 
     def __init__(self, problem):
         Explicit_ODE.__init__(self, problem)
@@ -109,7 +110,9 @@ cdef class ARKODE(Explicit_ODE):
         self._active_table = None
         self._fb_attempts0 = 0
         self._fb_fails0 = 0
+        self._fb_rhsfails0 = 0
         self.fallback_time = None
+        self.fallback_return_time = None
         SUNDIALS.SUNContext_Create(SUNDIALS.SUN_COMM_NULL, &self.ctx)
 
         self.set_problem_data()
@@ -152,10 +155,13 @@ cdef class ARKODE(Explicit_ODE):
         # without an event indicator): Newton on the stages of a many-stage method fails on most
         # steps there whatever the Jacobian, while a 2-stage method rides it. When more than
         # 'fallback_conv_fail_rate' of the last 'fallback_window' step attempts failed by nonlinear
-        # convergence, the memory is recreated with 'fallback_table' at the current point and the
-        # run continues with it (once per simulation, logged; None disables).
+        # convergence (steps failed by a recoverable rhs failure not counted: those are the
+        # model's, not the method's), the memory is recreated with 'fallback_table' at the current point and the
+        # run continues with it (once per simulation, logged; None disables). If the fallback
+        # table then fails hard (repeated error-test or convergence failures), the run switches
+        # back to the user's table at that point, once.
         self.options["fallback_table"] = "ARKODE_TRBDF2_3_3_2"
-        self.options["fallback_conv_fail_rate"] = 0.3
+        self.options["fallback_conv_fail_rate"] = 0.25
         self.options["fallback_window"] = 50
 
         self.statistics.add_key("nstepattempts", "Number of step attempts")
@@ -216,8 +222,11 @@ cdef class ARKODE(Explicit_ODE):
             self._free_memory()          # a previous simulation fell back: start again from the user's table
         self._active_table = self.options["table"]
         self.fallback_time = None
+        self.fallback_return_time = None
         self._fb_attempts0 = 0
         self._fb_fails0 = 0
+        self._fb_rhsfails0 = 0
+        self.pData.nrhsfails = 0
         self.initialize_arkode()
 
     cdef _free_memory(self):
@@ -285,12 +294,29 @@ cdef class ARKODE(Explicit_ODE):
             if flag < 0:
                 raise ARKODEError(flag, self.t)
 
+    cdef int _switch_table(self, double t, np.ndarray y, double tf, table) except -1:
+        """Recreates the memory block with `table` at (t, y), keeping the last step size."""
+        cdef double hlast = 0.0
+        cdef int flag
+        ARK.ARKodeGetLastStep(self.ark_mem, &hlast)
+        self.store_statistics(ARK_TSTOP_RETURN)
+        self.t = t
+        self.y = y
+        self._free_memory()
+        self._active_table = table
+        self.initialize_arkode()
+        self.initialize_options()
+        if hlast > 0.0:
+            flag = ARK.ARKodeSetInitStep(self.ark_mem, hlast)   # the controller's last step, not a fresh estimate
+            if flag < 0: raise ARKODEError(flag, t)
+        flag = ARK.ARKodeSetStopTime(self.ark_mem, tf)
+        if flag < 0: raise ARKODEError(flag, t)
+        return 0
+
     cdef int _fallback_check(self, double t, np.ndarray y, double tf) except -1:
         """Failure-rate monitor (see the 'fallback_*' options). Returns 1 after switching the
         memory block to the fallback table at (t, y), else 0."""
         cdef long int nattempts = 0, nfails = 0
-        cdef double hlast = 0.0
-        cdef int flag
         table = self.options["fallback_table"]
         if table is None or self.fallback_time is not None or self.options["method"] != "implicit" \
                 or table == self._active_table:
@@ -300,27 +326,43 @@ cdef class ARKODE(Explicit_ODE):
         window = int(self.options["fallback_window"])
         if nattempts - self._fb_attempts0 < window:
             return 0
-        rate = (nfails - self._fb_fails0) / float(nattempts - self._fb_attempts0)
+        # ARKODE counts a step failed by a recoverable rhs failure at a stage (an exception in
+        # the problem's rhs: the FMU's own solver not converging at a trial point) together with
+        # the steps Newton could not converge; only the latter say something about the method,
+        # so the rhs failures of the window are taken out (at most one per failed step)
+        nrhs = min(self.pData.nrhsfails - self._fb_rhsfails0, nfails - self._fb_fails0)
+        rate = (nfails - self._fb_fails0 - nrhs) / float(nattempts - self._fb_attempts0)
         self._fb_attempts0 = nattempts
         self._fb_fails0 = nfails
+        self._fb_rhsfails0 = self.pData.nrhsfails
         if rate <= float(self.options["fallback_conv_fail_rate"]):
             return 0
-        self.log_message("ARKODE: %.0f %% of the last %d step attempts failed by nonlinear convergence at t = %g; "
-                         "continuing with the table %s" % (100 * rate, window, t, table), NORMAL)
-        ARK.ARKodeGetLastStep(self.ark_mem, &hlast)
-        self.store_statistics(ARK_TSTOP_RETURN)
-        self.t = t
-        self.y = y
-        self._free_memory()
-        self._active_table = table
+        self.log_message("ARKODE: %.0f %% of the last %d step attempts failed by nonlinear convergence (rhs failures "
+                         "excluded) at t = %g; continuing with the table %s" % (100 * rate, window, t, table), NORMAL)
         self.fallback_time = t
-        self.initialize_arkode()
-        self.initialize_options()
-        if hlast > 0.0:
-            flag = ARK.ARKodeSetInitStep(self.ark_mem, hlast)   # the controller's last step, not a fresh estimate
-            if flag < 0: raise ARKODEError(flag, t)
-        flag = ARK.ARKodeSetStopTime(self.ark_mem, tf)
-        if flag < 0: raise ARKODEError(flag, t)
+        self._switch_table(t, y, tf, table)
+        return 1
+
+    cdef int _retry_after_failure(self, int flag, double t, double tf) except -1:
+        """After a hard failure of the fallback table (repeated error-test or convergence
+        failures), switch back to the user's table at the failure point, once. Returns 1 if
+        the integration can go on, else 0."""
+        cdef double tcur = t
+        cdef N_Vector ycur
+        cdef np.ndarray y
+        if flag not in (ARK_ERR_FAILURE, ARK_CONV_FAILURE) or self.fallback_time is None \
+                or self.fallback_return_time is not None:
+            return 0
+        ARK.ARKodeGetCurrentTime(self.ark_mem, &tcur)
+        ycur = N_VNew_Serial(self.pData.dim, self.ctx)
+        ARK.ARKodeGetDky(self.ark_mem, tcur, 0, ycur)
+        y = nv2arr(ycur)
+        N_VDestroy(ycur)
+        self.log_message("ARKODE: the table %s failed at t = %g (flag %d); continuing with the table %s"
+                         % (self._active_table, tcur, flag, self.options["table"] if self.options["table"]
+                            else "of order %d" % self.options["order"]), NORMAL)
+        self.fallback_return_time = tcur
+        self._switch_table(tcur, y, tf, self.options["table"])
         return 1
 
     cpdef initialize_options(self):
@@ -472,6 +514,8 @@ cdef class ARKODE(Explicit_ODE):
             while True:
                 flag = ARK.ARKodeEvolve(self.ark_mem, tf, yout, &tret, ARK_ONE_STEP)
                 if flag < 0:
+                    if self._retry_after_failure(flag, tret, tf):
+                        continue
                     self.store_statistics(ARK_TSTOP_RETURN)
                     N_VDestroy(yout)
                     raise ARKODEError(flag, tret)
@@ -517,6 +561,8 @@ cdef class ARKODE(Explicit_ODE):
             output_list = opts["output_list"][output_index:]
             for tout in output_list:
                 flag = ARK.ARKodeEvolve(self.ark_mem, tout, yout, &tret, ARK_NORMAL)
+                if flag < 0 and self._retry_after_failure(flag, tret, tf):
+                    flag = ARK.ARKodeEvolve(self.ark_mem, tout, yout, &tret, ARK_NORMAL)
                 if flag < 0:
                     self.store_statistics(ARK_TSTOP_RETURN)
                     N_VDestroy(yout)
@@ -673,7 +719,8 @@ cdef class ARKODE(Explicit_ODE):
         log(" Solver                  : ARKODE (%s, %s)" % (self.options["method"],
             self.options["table"] if self.options["table"] else "order %d" % self.options["order"]))
         if self.fallback_time is not None:
-            log(" Fallback                : %s from t = %g" % (self._active_table, self.fallback_time))
+            log(" Fallback                : %s from t = %g%s" % (self.options["fallback_table"], self.fallback_time,
+                "" if self.fallback_return_time is None else ", back from t = %g" % self.fallback_return_time))
         if self.options["method"] == "implicit":
             log(" Linear solver           : " + self.options["linear_solver"])
         log(" Tolerances (absolute)   : " + str(self._compact_tol(self.options["atol"])))

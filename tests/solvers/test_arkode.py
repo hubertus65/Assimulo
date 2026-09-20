@@ -276,7 +276,7 @@ class Test_ARKODE_fallback:
     def test_defaults(self):
         s = self._solver()
         assert s.fallback_table == "ARKODE_TRBDF2_3_3_2"
-        assert s.fallback_conv_fail_rate == 0.3
+        assert s.fallback_conv_fail_rate == 0.25
         assert s.fallback_window == 50
         assert s.fallback_time is None
         with pytest.raises(AssimuloException):
