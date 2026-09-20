@@ -177,6 +177,16 @@ cdef class ARKODE(Explicit_ODE):
         self.pData.verbose = 2
         self.pData.create_work_arrays()
 
+    cdef N_Vector _arr2nv(self, x):
+        """A serial N_Vector holding a copy of `x`, created in this solver's SUNContext
+        (the generic arr2nv of sundials_callbacks.pxi creates and leaks a new context per
+        call; each context also reopens the SUNLogger files from the environment, which
+        truncates a log written for debugging)."""
+        cdef np.ndarray[realtype, ndim=1, mode='c'] ndx = np.array(x, dtype=np.float64)
+        cdef N_Vector v = N_VNew_Serial(len(ndx), self.ctx)
+        memcpy((<N_VectorContent_Serial>v.content).data, <void*>PyArray_DATA(ndx), len(ndx)*sizeof(realtype))
+        return v
+
     cpdef initialize(self):
         self.statistics.reset()
         self.initialize_arkode()
@@ -205,7 +215,7 @@ cdef class ARKODE(Explicit_ODE):
 
         if self.yTemp != NULL:
             N_VDestroy(self.yTemp)
-        self.yTemp = arr2nv(self.y)
+        self.yTemp = self._arr2nv(self.y)
         self.pData.verbose = 2 if self.verbosity <= NORMAL else 3
 
         if self.problem_info["switches"]:
@@ -353,7 +363,7 @@ cdef class ARKODE(Explicit_ODE):
         # tolerances (atol may have changed with the nominals in handle_event)
         if self.nv_atol != NULL:
             N_VDestroy(self.nv_atol)
-        self.nv_atol = arr2nv(self.options["atol"])
+        self.nv_atol = self._arr2nv(self.options["atol"])
         flag = ARK.ARKodeSVtolerances(self.ark_mem, float(self.options["rtol"]), self.nv_atol)
         if flag < 0: raise ARKODEError(flag, self.t)
 
@@ -377,7 +387,7 @@ cdef class ARKODE(Explicit_ODE):
         cdef list tr = [], yr = []
         cdef np.ndarray output_list
 
-        yout = arr2nv(y)
+        yout = self._arr2nv(y)
 
         if opts["initialize"]:
             self.initialize_arkode()
@@ -470,7 +480,7 @@ cdef class ARKODE(Explicit_ODE):
         cdef int flag
         cdef N_Vector yout
         cdef double tret = t
-        yout = arr2nv(y)
+        yout = self._arr2nv(y)
         if opts["initialize"]:
             self.initialize_arkode()
             self.initialize_options()
