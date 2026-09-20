@@ -9,6 +9,15 @@
  * bhat = ((1-w)/3, (3w+1)/3, d/3); local error e = h sum (b_i - bhat_i) f_i, filtered with M^-1
  * (Hosea & Shampine's stiff modification) before the norm is taken.
  *
+ * The stage derivatives f_i are taken from the stage equations, f_i = (y_i - c_i) / (d h), not from
+ * an rhs call at the converged iterate (Hosea & Shampine, section 5): the Newton iterate is within
+ * newton_tol of the stage value, and for a stiff component an rhs call there is off by h*lambda
+ * times that, which pollutes the FSAL derivative, the TR stage of the next step and the dense
+ * output. The algebraic value is off by (1/d) times the Newton error only. This also saves two
+ * rhs calls per step. Predictors: stage 1 extrapolates the previous step's dense output, stage 2
+ * the quadratic through y0, y1 with slope f1 (both measured on the reference FMUs; explicit Euler
+ * for stage 1 fails on the data-center model).
+ *
  * Jacobian policy as in CVode: the Jacobian is recomputed only on the first step, after a Newton
  * failure with a stale Jacobian, or after max_steps_between_jac accepted steps; the LU is redone
  * whenever h changes (h is kept when the proposed change is within [keep_lo, keep_hi]).
@@ -24,6 +33,7 @@
 static int trace_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TRBDF2_TRACE"); v = e ? atoi(e) : 0; } return v; }
 
 #define SQRT2 1.4142135623730950488
+#define NEWTON_DIV_RATE 2.0   /* Newton is declared diverging when |delta_k| >= NEWTON_DIV_RATE |delta_{k-1}| (CVode's RDIV) */
 static const double GAMMA_ = 2.0 - SQRT2;         /* 0.5857864376269049 */
 static const double D_     = 1.0 - SQRT2 / 2.0;    /* gamma/2 = 0.2928932188134524 */
 static const double W_     = SQRT2 / 4.0;          /* 0.3535533905932738 */
@@ -32,7 +42,9 @@ struct trbdf2_mem {
     int n;
     double *rtol, *atol;                 /* n */
     double *y0, *f0, *y1, *f1, *y2, *f2; /* stage values of the current step; f0 is FSAL */
-    double *fd0;                         /* rhs at the start of the last accepted step (dense output) */
+    double *fd0, *yd1, *fd1;             /* dense output: derivative at the start, state and derivative at the end of the
+                                            last accepted step (y0 holds its start; y2/f2 may belong to a rejected attempt) */
+    double *fbase;                       /* rhs at the base point of a finite-difference Jacobian */
     double *ytmp, *ftmp, *delta, *err, *werr, *scal;
     double *jac, *lu;                    /* n*n column-major */
     int *piv;
@@ -108,19 +120,20 @@ int trbdf2_create(int n, trbdf2_mem **mem_out) {
     m->y0 = (double *)malloc(n * sizeof(double)); m->f0 = (double *)malloc(n * sizeof(double));
     m->y1 = (double *)malloc(n * sizeof(double)); m->f1 = (double *)malloc(n * sizeof(double));
     m->y2 = (double *)malloc(n * sizeof(double)); m->f2 = (double *)malloc(n * sizeof(double));
-    m->fd0 = (double *)malloc(n * sizeof(double));
+    m->fd0 = (double *)malloc(n * sizeof(double)); m->yd1 = (double *)malloc(n * sizeof(double)); m->fd1 = (double *)malloc(n * sizeof(double));
+    m->fbase = (double *)malloc(n * sizeof(double));
     m->ytmp = (double *)malloc(n * sizeof(double)); m->ftmp = (double *)malloc(n * sizeof(double));
     m->delta = (double *)malloc(n * sizeof(double)); m->err = (double *)malloc(n * sizeof(double));
     m->werr = (double *)malloc(n * sizeof(double)); m->scal = (double *)malloc(n * sizeof(double));
     m->jac = (double *)malloc((size_t)n * n * sizeof(double)); m->lu = (double *)malloc((size_t)n * n * sizeof(double));
     m->piv = (int *)malloc(n * sizeof(int));
-    if (!m->rtol || !m->atol || !m->y0 || !m->f0 || !m->y1 || !m->f1 || !m->y2 || !m->f2 || !m->fd0 || !m->ytmp || !m->ftmp ||
+    if (!m->rtol || !m->atol || !m->y0 || !m->f0 || !m->y1 || !m->f1 || !m->y2 || !m->f2 || !m->fd0 || !m->yd1 || !m->fd1 || !m->fbase || !m->ytmp || !m->ftmp ||
         !m->delta || !m->err || !m->werr || !m->scal || !m->jac || !m->lu || !m->piv) {
         trbdf2_free(&m); return TRBDF2_ERROR_MEM;
     }
     { int i; for (i = 0; i < n; i++) { m->rtol[i] = 1e-6; m->atol[i] = 1e-8; } }
-    m->hmax = 0.0; m->safety = 0.9; m->fac_min = 0.2; m->fac_max = 5.0; m->keep_lo = 0.9; m->keep_hi = 1.1;
-    m->newton_tol = 0.05; m->newton_max = 6; m->max_between_jac = 50; m->use_user_jac = 1;
+    m->hmax = 0.0; m->safety = 0.9; m->fac_min = 0.2; m->fac_max = 5.0; m->keep_lo = 0.8; m->keep_hi = 1.25;
+    m->newton_tol = 0.1; m->newton_max = 6; m->max_between_jac = 50; m->use_user_jac = 1;
     m->fail_factor = 0.25; m->fail_max = 40; m->max_steps = 100000;
     *mem_out = m;
     return trbdf2_reinit(m);
@@ -130,7 +143,7 @@ void trbdf2_free(trbdf2_mem **mem) {
     trbdf2_mem *m;
     if (mem == NULL || *mem == NULL) return;
     m = *mem;
-    free(m->rtol); free(m->atol); free(m->y0); free(m->f0); free(m->y1); free(m->f1); free(m->y2); free(m->f2); free(m->fd0);
+    free(m->rtol); free(m->atol); free(m->y0); free(m->f0); free(m->y1); free(m->f1); free(m->y2); free(m->f2); free(m->fd0); free(m->yd1); free(m->fd1); free(m->fbase);
     free(m->ytmp); free(m->ftmp); free(m->delta); free(m->err); free(m->werr); free(m->scal);
     free(m->jac); free(m->lu); free(m->piv);
     free(m); *mem = NULL;
@@ -178,13 +191,18 @@ void trbdf2_get_stats(trbdf2_mem *m, trbdf2_stats *s) { if (m && s) *s = m->stat
 const char *trbdf2_get_err_msg(trbdf2_mem *m) { return m ? m->err_msg : "no memory"; }
 
 /* ------------------------------------------------------------------ Jacobian */
-static int form_jacobian(trbdf2_mem *m, trbdf2_rhs_fn rhs, trbdf2_jac_fn jac, void *user, double t, const double *y, const double *f) {
+static int form_jacobian(trbdf2_mem *m, trbdf2_rhs_fn rhs, trbdf2_jac_fn jac, void *user, double t, const double *y) {
     int n = m->n, i, j, ret;
+    const double *f = m->fbase;
     if (m->use_user_jac && jac != NULL) {
         ret = jac(n, t, y, m->jac, user);
         if (ret != 0) return ret;
     } else {
-        /* forward differences, one column per component */
+        /* forward differences, one column per component, from an rhs call at the base point
+           (f0 is the algebraic stage derivative, not accurate enough for a difference quotient) */
+        ret = rhs(n, t, y, m->fbase, user);
+        m->stats.nfcnjac++;
+        if (ret != 0) return ret;
         for (j = 0; j < n; j++) {
             double dy = sqrt(2.2e-16) * fmax(fabs(y[j]), m->atol[j] / m->rtol[j] > 0.0 ? m->atol[j] / m->rtol[j] : 1e-5);
             if (dy == 0.0) dy = 1e-8;
@@ -214,11 +232,11 @@ static int form_lu(trbdf2_mem *m, double h) {
 
 /* ------------------------------------------------------------------ Newton for one stage
  * Solves  y - c_y - dh f(ts, y) = rhs_const  with the fixed matrix M = I - dh J.
- * y holds the predictor on entry and the solution on exit; fy the rhs at the solution.
+ * y holds the predictor on entry and the solution on exit; fy the stage derivative (y - cvec) / dh.
  * Returns 0 converged, 1 not converged (diverged / too many iterations), > 1 recoverable rhs failure,
  * < 0 unrecoverable. */
 static int newton_stage(trbdf2_mem *m, trbdf2_rhs_fn rhs, void *user, double ts, double dh,
-                        const double *cvec, double *y, double *fy) {
+                        const double *cvec, double *y, double *fy, int stage) {
     int n = m->n, i, k, ret;
     double dnorm, dnorm_old = 0.0, rate = 0.0;
     for (k = 0; k < m->newton_max; k++) {
@@ -233,17 +251,15 @@ static int newton_stage(trbdf2_mem *m, trbdf2_rhs_fn rhs, void *user, double ts,
         for (i = 0; i < n; i++) y[i] += m->delta[i];
         dnorm = wrms(m, m->delta);
         if (k > 0) rate = dnorm / dnorm_old;
-        if (trace_on() > 1) fprintf(stderr, "      newton k=%d |delta|=%.3e rate=%.3f\n", k, dnorm, rate);
+        if (trace_on() > 1) fprintf(stderr, "      stage %d newton k=%d |delta|=%.3e rate=%.3f\n", stage, k, dnorm, rate);
         /* converged when the correction is small, or when the estimated remaining error
            |delta| * rate/(1-rate) is; the divergence test only applies to corrections that are
            not small already (a converged iterate's next correction is roundoff with a random ratio) */
         if (dnorm <= m->newton_tol || (k > 0 && rate < 1.0 && dnorm * rate / (1.0 - rate) <= m->newton_tol)) {
-            ret = rhs(n, ts, y, fy, user);                                /* rhs at the converged stage value */
-            m->stats.nfcn++;
-            if (ret != 0) return ret > 0 ? 2 : ret;
+            for (i = 0; i < n; i++) fy[i] = (y[i] - cvec[i]) / dh;    /* stage derivative from the stage equation (see the file comment) */
             return 0;
         }
-        if (k > 0 && rate >= 0.9) { m->stats.nnfail_div++; return 1; }      /* diverging */
+        if (k > 0 && rate >= NEWTON_DIV_RATE) { m->stats.nnfail_div++; return 1; }      /* diverging */
         dnorm_old = dnorm;
     }
     m->stats.nnfail_iter++;
@@ -275,28 +291,15 @@ static int initial_step(trbdf2_mem *m, trbdf2_rhs_fn rhs, void *user, double t, 
 }
 
 /* ------------------------------------------------------------------ dense output */
-#ifndef TRBDF2_INTERP
-#define TRBDF2_INTERP 1
-#endif
 int trbdf2_interpolate(trbdf2_mem *m, double t, double *y_out) {
     int n, i; double s, a, b, c, dd, h;
     if (!m) return TRBDF2_ERROR_MEM;
     if (m->h == 0.0) return TRBDF2_ERROR_INPUT;
     n = m->n; h = m->h;
     s = (t - m->t0) / h;
-#if TRBDF2_INTERP == 0
-    /* piecewise cubic Hermite through the three stage points, using the stage derivatives;
-       f at the TR stage is not stiffly accurate and pollutes the interpolant on stiff problems */
-    { double h1, *ya, *fa, *yb, *fb;
-      if (s <= GAMMA_) { ya = m->y0; fa = m->fd0; yb = m->y1; fb = m->f1; h1 = GAMMA_ * h; s = (t - m->t0) / h1; }
-      else { ya = m->y1; fa = m->f1; yb = m->y2; fb = m->f2; h1 = (1.0 - GAMMA_) * h; s = (t - m->t0 - GAMMA_ * h) / h1; }
-      a = (1.0 + 2.0 * s) * (1.0 - s) * (1.0 - s); b = s * (1.0 - s) * (1.0 - s); c = s * s * (3.0 - 2.0 * s); dd = s * s * (s - 1.0);
-      for (i = 0; i < n; i++) y_out[i] = a * ya[i] + b * h1 * fa[i] + c * yb[i] + dd * h1 * fb[i]; }
-#else
-    /* cubic Hermite over the whole step through the two stiffly accurate end points (y0, f0), (y2, f2) */
+    /* cubic Hermite over the whole step through the two stiffly accurate end points of the last accepted step */
     a = (1.0 + 2.0 * s) * (1.0 - s) * (1.0 - s); b = s * (1.0 - s) * (1.0 - s); c = s * s * (3.0 - 2.0 * s); dd = s * s * (s - 1.0);
-    for (i = 0; i < n; i++) y_out[i] = a * m->y0[i] + b * h * m->fd0[i] + c * m->y2[i] + dd * h * m->f2[i];
-#endif
+    for (i = 0; i < n; i++) y_out[i] = a * m->y0[i] + b * h * m->fd0[i] + c * m->yd1[i] + dd * h * m->fd1[i];
     return TRBDF2_OK;
 }
 
@@ -343,7 +346,7 @@ int trbdf2_solve(trbdf2_mem *m, trbdf2_rhs_fn rhs, trbdf2_jac_fn jac, trbdf2_sol
         /* Jacobian / LU */
         jac_fresh_this_attempt = 0;
         if (!m->have_jac || m->steps_since_jac >= m->max_between_jac) {
-            ret = form_jacobian(m, rhs, jac, user, *t, y, m->f0);
+            ret = form_jacobian(m, rhs, jac, user, *t, y);
             if (ret > 0) { m->stats.nrhsfail++; goto recoverable; }
             if (ret < 0) { fail(m, "Jacobian evaluation failed", *t); return TRBDF2_ERROR_CALLBACK; }
             jac_fresh_this_attempt = 1;
@@ -363,16 +366,17 @@ int trbdf2_solve(trbdf2_mem *m, trbdf2_rhs_fn rhs, trbdf2_jac_fn jac, trbdf2_sol
         for (i = 0; i < n; i++) m->ytmp[i] = y[i] + D_ * dir * h * m->f0[i];
         if (m->h != 0.0 && m->t0 + m->h == *t) trbdf2_interpolate(m, *t + dir * GAMMA_ * h, m->y1);
         else for (i = 0; i < n; i++) m->y1[i] = y[i] + GAMMA_ * dir * h * m->f0[i];
-        ret = newton_stage(m, rhs, user, *t + dir * GAMMA_ * h, D_ * dir * h, m->ytmp, m->y1, m->f1);
+        ret = newton_stage(m, rhs, user, *t + dir * GAMMA_ * h, D_ * dir * h, m->ytmp, m->y1, m->f1, 1);
         if (ret < 0) { fail(m, "rhs failed (unrecoverable) in stage 1", *t); return TRBDF2_ERROR_CALLBACK; }
         if (ret == 2) { m->stats.nrhsfail++; goto recoverable; }
         if (ret == 1) goto newton_failure;
 
-        /* ---- stage 2 (BDF2): y2 - (a1 y1 - a0 y) - dh f(y2) = 0 */
+        /* ---- stage 2 (BDF2): y2 - (a1 y1 - a0 y) - dh f(y2) = 0
+           predictor: the quadratic through y (s = 0) and y1 (s = gamma) with slope f1 at y1, at s = 1 */
         for (i = 0; i < n; i++) m->ytmp[i] = a1 * m->y1[i] - a0 * y[i];
-        if (m->h != 0.0 && m->t0 + m->h == *t) trbdf2_interpolate(m, *t + dir * h, m->y2);
-        else for (i = 0; i < n; i++) m->y2[i] = m->y1[i] + (1.0 - GAMMA_) / GAMMA_ * (m->y1[i] - y[i]);   /* linear extrapolation */
-        ret = newton_stage(m, rhs, user, *t + dir * h, D_ * dir * h, m->ytmp, m->y2, m->f2);
+        { double sg = 1.0 - GAMMA_, q = sg * sg / (GAMMA_ * GAMMA_);
+          for (i = 0; i < n; i++) m->y2[i] = m->y1[i] + sg * dir * h * m->f1[i] + q * (y[i] - m->y1[i] + GAMMA_ * dir * h * m->f1[i]); }
+        ret = newton_stage(m, rhs, user, *t + dir * h, D_ * dir * h, m->ytmp, m->y2, m->f2, 2);
         if (ret < 0) { fail(m, "rhs failed (unrecoverable) in stage 2", *t); return TRBDF2_ERROR_CALLBACK; }
         if (ret == 2) { m->stats.nrhsfail++; goto recoverable; }
         if (ret == 1) goto newton_failure;
@@ -412,6 +416,8 @@ int trbdf2_solve(trbdf2_mem *m, trbdf2_rhs_fn rhs, trbdf2_jac_fn jac, trbdf2_sol
         m->t0 = *t; m->h = dir * h;
         memcpy(m->y0, y, n * sizeof(double));
         memcpy(m->fd0, m->f0, n * sizeof(double));
+        memcpy(m->yd1, m->y2, n * sizeof(double));
+        memcpy(m->fd1, m->f2, n * sizeof(double));
         tn = last ? tend : *t + dir * h;
         memcpy(y, m->y2, n * sizeof(double));
         memcpy(m->f0, m->f2, n * sizeof(double));            /* FSAL */

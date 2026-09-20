@@ -70,6 +70,9 @@ class Test_TRBDF2:
         assert y[-1][0] == pytest.approx(yref[-1][0], abs=1e-4)
         assert sim.statistics["nfcnjacs"] == 0            # the user Jacobian was used
         assert sim.statistics["nsteps"] < 5000
+        # stage derivatives come from the stage equations: no rhs call beyond the Newton
+        # iterations except the start of the integration and the initial-step estimate
+        assert sim.statistics["nfcns"] <= sim.statistics["nniters"] + 2
 
     def test_no_jac(self):
         mod = vanderpol(mu=100.0)
@@ -78,7 +81,7 @@ class Test_TRBDF2:
         sim.verbosity = 50
         assert not sim.usejac
         sim.simulate(1.0)
-        assert sim.statistics["nfcnjacs"] == 2 * sim.statistics["njacs"]   # forward differences, one per column
+        assert sim.statistics["nfcnjacs"] == 3 * sim.statistics["njacs"]   # forward differences: base point + one per column
 
     def test_interpolate_and_ncp(self):
         """Dense output: communication points are interpolated, not stepped to."""
@@ -176,3 +179,13 @@ class Test_TRBDF2:
         assert sim.maxh is None
         sim.maxh = 0.1
         assert sim.maxh == 0.1
+        sim.atol = 1e-8
+        sim.newton_tol = 0.05
+        sim.lu_band = [0.9, 1.1]
+        sim.fac2 = 10.0
+        assert sim.newton_tol == 0.05 and sim.lu_band == (0.9, 1.1) and sim.fac2 == 10.0
+        sim.verbosity = 50
+        sim.simulate(0.1)                # the properties reach the C stepper without an error
+        with pytest.raises(TRBDF2Error, match="Invalid option"):
+            sim.lu_band = (1.5, 2.0)     # lower bound above 1
+            sim.simulate(0.1)

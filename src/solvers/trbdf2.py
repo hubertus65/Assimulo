@@ -60,11 +60,11 @@ class TRBDF2(Explicit_ODE):
         self.options["atol"] = 1.0e-6 * np.ones(self.problem_info["dim"])
         self.options["usejac"] = True if self.problem_info["jac_fcn"] else False
         self.options["newt"] = 6                # maximum Newton iterations per stage
-        self.options["newton_tol"] = 0.05       # Newton stopping tolerance in the weighted norm
+        self.options["newton_tol"] = 0.1        # Newton stopping tolerance in the weighted norm (CVode's value)
         self.options["safe"] = 0.9              # step-size safety factor
         self.options["fac1"] = 0.2              # smallest step-size decrease factor
         self.options["fac2"] = 5.0              # largest step-size increase factor
-        self.options["lu_band"] = (0.9, 1.1)    # reuse the LU while h/h_lu is within
+        self.options["lu_band"] = (0.8, 1.25)   # reuse the LU while h/h_lu is within
         self.options["maxsteps_jac"] = 50       # steps between Jacobian evaluations without Newton failure
         self.options["fail_factor"] = 0.25      # step reduction on a recoverable rhs/jac failure
         self.options["fail_max"] = 40           # budget of consecutive recoverable failures
@@ -331,3 +331,40 @@ class TRBDF2(Explicit_ODE):
     def _get_safe(self):
         return self.options["safe"]
     safe = property(_get_safe, _set_safe)
+
+    def _set_newton_tol(self, v):
+        self.options["newton_tol"] = float(v)
+    def _get_newton_tol(self):
+        return self.options["newton_tol"]
+    newton_tol = property(_get_newton_tol, _set_newton_tol)
+
+    def _set_lu_band(self, band):
+        lo, hi = band
+        self.options["lu_band"] = (float(lo), float(hi))
+    def _get_lu_band(self):
+        return self.options["lu_band"]
+    lu_band = property(_get_lu_band, _set_lu_band)
+
+    def _set_fac1(self, v):
+        self.options["fac1"] = float(v)
+    def _get_fac1(self):
+        return self.options["fac1"]
+    fac1 = property(_get_fac1, _set_fac1)
+
+    def _set_fac2(self, v):
+        self.options["fac2"] = float(v)
+    def _get_fac2(self):
+        return self.options["fac2"]
+    fac2 = property(_get_fac2, _set_fac2)
+
+    def _set_fail_factor(self, v):
+        self.options["fail_factor"] = float(v)
+    def _get_fail_factor(self):
+        return self.options["fail_factor"]
+    fail_factor = property(_get_fail_factor, _set_fail_factor)
+
+    def _set_fail_max(self, n):
+        self.options["fail_max"] = int(n)
+    def _get_fail_max(self):
+        return self.options["fail_max"]
+    fail_max = property(_get_fail_max, _set_fail_max)
