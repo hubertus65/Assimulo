@@ -136,7 +136,7 @@ cdef class ARKODE(Explicit_ODE):
         self.options["nonlin_conv_coef"] = 0.1
         self.options["max_nonlin_iters"] = 4  # ARKODE default 3; 4 saves 60 % of the Jacobians on Van der Pol
         self.options["deduce_implicit_rhs"] = True   # stage derivatives from the stage equations
-        self.options["interpolant_degree"] = -1      # -1: ARKODE's default for the method
+        self.options["interpolant_degree"] = 3       # -1: ARKODE's default for the method (its order); 3: the cubic Hermite interpolant -- the quintic of order 5 costs rhs evaluations at every output point and reports spurious events under rootfinding, orders <= 4 are unchanged
         self.options["maxncf"] = 10           # max convergence failures per step
         self.options["lsetup_frequency"] = 20     # steps between linear-solver setups (ARKODE default 20)
         self.options["jac_eval_frequency"] = 51   # setups between Jacobian evaluations (ARKODE default 51)
