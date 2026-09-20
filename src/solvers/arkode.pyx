@@ -115,7 +115,7 @@ cdef class ARKODE(Explicit_ODE):
         self.options["method"] = "implicit"   # "implicit" (DIRK) or "explicit" (ERK)
         self.options["order"] = 4             # method order when 'table' is None
         self.options["table"] = None          # Butcher table name, overrides 'order'
-        self.options["predictor"] = 1         # ARKODE predictor 0-5; 1 (dense-output extrapolation) halves the steps of 0 (y_n) on Van der Pol
+        self.options["predictor"] = 2         # ARKODE predictor 0-5; 0 (y_n) needs 2.4x the steps on Van der Pol, 2 (variable-order) halves the Newton failures of 1 on the data-center FMU
         self.options["nonlin_conv_coef"] = 0.1
         self.options["max_nonlin_iters"] = 4  # ARKODE default 3; 4 saves 60 % of the Jacobians on Van der Pol
         self.options["deduce_implicit_rhs"] = True   # stage derivatives from the stage equations
@@ -123,7 +123,7 @@ cdef class ARKODE(Explicit_ODE):
         self.options["maxncf"] = 10           # max convergence failures per step
         self.options["lsetup_frequency"] = 20     # steps between linear-solver setups (ARKODE default 20)
         self.options["jac_eval_frequency"] = 51   # setups between Jacobian evaluations (ARKODE default 51)
-        self.options["delta_gamma_max"] = 0.2     # relative change of gamma that forces a new setup (ARKODE default 0.2)
+        self.options["delta_gamma_max"] = 0.05    # relative change of gamma that forces a new setup (ARKODE default 0.2; 0.05 saves 10-15 % rhs and most error-test failures on the FMUs)
         self.options["maxnef"] = 7            # max error test failures per step
         self.options["restart_h"] = "estimate"   # after an event: "estimate" a new first step or "keep" the last
         self.options["report_continuously"] = False
