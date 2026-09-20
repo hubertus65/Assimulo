@@ -26,7 +26,7 @@ Building with meson-python (Python >= 3.12, where numpy.distutils no longer exis
 ------------------------------------------------------------------------------------
     pip install --no-build-isolation \
         -Csetup-args=-Dsundials-home=$CONDA_PREFIX \
-        -Csetup-args=-Dsuperlu-home=$CONDA_PREFIX/superlu_mt_home \
+        -Csetup-args=-Dsuperlu-home=$CONDA_PREFIX \
         -Csetup-args=-Dblas-home=$CONDA_PREFIX/lib -Csetup-args=-Dlapack-home=$CONDA_PREFIX/lib .
 
 Options (meson.options): sundials-home, superlu-home, blas-home, lapack-home, fortran

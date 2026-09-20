@@ -62,10 +62,14 @@ have_superlu = false
 superlu_libs = []
 superlu_inc = []
 if superlu_home != ''
+  # layouts: a SuperLU_MT source tree (SRC/), an install prefix (include/), or a conda-forge
+  # prefix whose sundials package ships the library (include/superlu_mt/, lib/)
   superlu_incdir = superlu_home / 'SRC'
-  if not fs.exists(superlu_incdir / 'supermatrix.h')
-    superlu_incdir = superlu_home / 'include'
-  endif
+  foreach cand : [superlu_home / 'include', superlu_home / 'include' / 'superlu_mt']
+    if not fs.exists(superlu_incdir / 'supermatrix.h')
+      superlu_incdir = cand
+    endif
+  endforeach
   if fs.exists(superlu_incdir / 'supermatrix.h')
     have_superlu = true
     superlu_inc = include_directories(superlu_incdir)
