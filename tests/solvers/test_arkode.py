@@ -242,6 +242,8 @@ class Test_ARKODE:
         sim.lsetup_frequency = 5
         sim.jac_eval_frequency = 10
         sim.delta_gamma_max = 0.1
+        sim.max_growth = 5.0
+        sim.safety = 0.9
         assert sim.predictor == 2 and sim.nonlin_conv_coef == 0.05 and not sim.deduce_implicit_rhs
         sim.verbosity = 50
         sim.simulate(0.01)                # the properties reach ARKODE without an error

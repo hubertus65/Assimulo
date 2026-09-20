@@ -90,6 +90,10 @@ cdef extern from "arkode/arkode.h":
     int ARKodeSetNonlinConvCoef(void* arkode_mem, realtype nlscoef) noexcept
     int ARKodeSetAdaptControllerByName(void* arkode_mem, const char* cname) noexcept
     int ARKodeSetSafetyFactor(void* arkode_mem, realtype safety) noexcept
+    int ARKodeSetMaxGrowth(void* arkode_mem, realtype mx_growth) noexcept
+    int ARKodeSetMaxFirstGrowth(void* arkode_mem, realtype etamx1) noexcept
+    int ARKodeSetMaxEFailGrowth(void* arkode_mem, realtype etamxf) noexcept
+    int ARKodeSetMaxCFailGrowth(void* arkode_mem, realtype etacf) noexcept
     int ARKodeSetMaxErrTestFails(void* arkode_mem, int maxnef) noexcept
     int ARKodeSetMaxHnilWarns(void* arkode_mem, int mxhnil) noexcept
     int ARKodeSetInitStep(void* arkode_mem, realtype hin) noexcept

@@ -126,6 +126,13 @@ cdef class ARKODE(Explicit_ODE):
         self.options["delta_gamma_max"] = 0.05    # relative change of gamma that forces a new setup (ARKODE default 0.2; 0.05 saves 10-15 % rhs and most error-test failures on the FMUs)
         self.options["maxnef"] = 7            # max error test failures per step
         self.options["restart_h"] = "estimate"   # after an event: "estimate" a new first step or "keep" the last
+        # step-size adaptivity bounds (ARKODE defaults: safety 0.96, max_growth 20, max_first_growth 1e4,
+        # max_efail_growth 0.3, max_cfail_growth 0.25)
+        self.options["safety"] = 0.96
+        self.options["max_growth"] = 20.0
+        self.options["max_first_growth"] = 10000.0
+        self.options["max_efail_growth"] = 0.3
+        self.options["max_cfail_growth"] = 0.25
         self.options["report_continuously"] = False
 
         self.statistics.add_key("nstepattempts", "Number of step attempts")
@@ -313,6 +320,18 @@ cdef class ARKODE(Explicit_ODE):
                 if flag < 0: raise ARKODEError(flag, self.t)
             self._fresh_memory = 0
 
+        # step-size adaptivity bounds
+        flag = ARK.ARKodeSetSafetyFactor(self.ark_mem, float(self.options["safety"]))
+        if flag < 0: raise ARKODEError(flag, self.t)
+        flag = ARK.ARKodeSetMaxGrowth(self.ark_mem, float(self.options["max_growth"]))
+        if flag < 0: raise ARKODEError(flag, self.t)
+        flag = ARK.ARKodeSetMaxFirstGrowth(self.ark_mem, float(self.options["max_first_growth"]))
+        if flag < 0: raise ARKODEError(flag, self.t)
+        flag = ARK.ARKodeSetMaxEFailGrowth(self.ark_mem, float(self.options["max_efail_growth"]))
+        if flag < 0: raise ARKODEError(flag, self.t)
+        if method == "implicit":
+            flag = ARK.ARKodeSetMaxCFailGrowth(self.ark_mem, float(self.options["max_cfail_growth"]))
+            if flag < 0: raise ARKODEError(flag, self.t)
         # step limits
         flag = ARK.ARKodeSetMaxErrTestFails(self.ark_mem, int(self.options["maxnef"]))
         if flag < 0: raise ARKODEError(flag, self.t)
@@ -748,6 +767,36 @@ cdef class ARKODE(Explicit_ODE):
     def _get_delta_gamma_max(self):
         return self.options["delta_gamma_max"]
     delta_gamma_max = property(_get_delta_gamma_max, _set_delta_gamma_max)
+
+    def _set_safety(self, v):
+        self.options["safety"] = float(v)
+    def _get_safety(self):
+        return self.options["safety"]
+    safety = property(_get_safety, _set_safety)
+
+    def _set_max_growth(self, v):
+        self.options["max_growth"] = float(v)
+    def _get_max_growth(self):
+        return self.options["max_growth"]
+    max_growth = property(_get_max_growth, _set_max_growth)
+
+    def _set_max_first_growth(self, v):
+        self.options["max_first_growth"] = float(v)
+    def _get_max_first_growth(self):
+        return self.options["max_first_growth"]
+    max_first_growth = property(_get_max_first_growth, _set_max_first_growth)
+
+    def _set_max_efail_growth(self, v):
+        self.options["max_efail_growth"] = float(v)
+    def _get_max_efail_growth(self):
+        return self.options["max_efail_growth"]
+    max_efail_growth = property(_get_max_efail_growth, _set_max_efail_growth)
+
+    def _set_max_cfail_growth(self, v):
+        self.options["max_cfail_growth"] = float(v)
+    def _get_max_cfail_growth(self):
+        return self.options["max_cfail_growth"]
+    max_cfail_growth = property(_get_max_cfail_growth, _set_max_cfail_growth)
 
     def _set_restart_h(self, v):
         v = str(v).lower()
