@@ -40,6 +40,7 @@ struct trbdf2_mem {
     double h_next;                       /* step size proposed for the next step */
     double h_lu;                         /* step size the LU was formed with (0: no LU) */
     double err_prev;                     /* error norm of the previous accepted step (PI controller), 0: none */
+    int first_step;                      /* no step accepted yet in this segment: growth cap 1e4 (CVode's ETAMX1) */
     int have_lu, have_jac, have_f0;
     long steps_since_jac;
     /* options */
@@ -167,7 +168,7 @@ int trbdf2_set_failure_policy(trbdf2_mem *m, double step_factor, int max_consecu
 int trbdf2_reinit(trbdf2_mem *m) {
     if (!m) return TRBDF2_ERROR_MEM;
     m->h = 0.0; m->h_next = 0.0; m->h_lu = 0.0; m->have_lu = 0; m->have_jac = 0; m->have_f0 = 0; m->err_prev = 0.0;
-    m->steps_since_jac = 0; m->err_msg[0] = '\0';
+    m->steps_since_jac = 0; m->first_step = 1; m->err_msg[0] = '\0';
     memset(&m->stats, 0, sizeof(m->stats));
     return TRBDF2_OK;
 }
@@ -255,7 +256,7 @@ static int initial_step(trbdf2_mem *m, trbdf2_rhs_fn rhs, void *user, double t, 
     double dnf, dny, h, der2, h1, dir = tend > t ? 1.0 : -1.0, span = fabs(tend - t);
     set_scale(m, y);
     dnf = wrms(m, m->f0); dny = wrms(m, y);
-    h = (dnf <= 1e-10 || dny <= 1e-10) ? 1e-6 : 0.01 * dny / dnf;
+    h = (dnf <= 1e-10 || dny <= 1e-10) ? 1e-6 : 0.01 * sqrt(dny / dnf);   /* Hairer's hinit */
     h = fmin(h, span);
     if (m->hmax > 0.0) h = fmin(h, m->hmax);
     for (i = 0; i < n; i++) m->ytmp[i] = y[i] + dir * h * m->f0[i];
@@ -266,6 +267,7 @@ static int initial_step(trbdf2_mem *m, trbdf2_rhs_fn rhs, void *user, double t, 
     der2 = wrms(m, m->ftmp);
     h1 = (fmax(der2, dnf) <= 1e-15) ? fmax(1e-6, h * 1e-3) : pow(0.01 / fmax(der2, dnf), 1.0 / 3.0);
     h = fmin(100.0 * h, h1);
+    h = fmax(h, 1e-8 * span);                  /* a too-small guess is corrected by the first step's growth (see fac_first) */
     h = fmin(h, span);
     if (m->hmax > 0.0) h = fmin(h, m->hmax);
     *h0 = h;
@@ -309,7 +311,7 @@ int trbdf2_solve(trbdf2_mem *m, trbdf2_rhs_fn rhs, trbdf2_jac_fn jac, trbdf2_sol
     a1 = 1.0 / (GAMMA_ * (2.0 - GAMMA_));
     a0 = (1.0 - GAMMA_) * (1.0 - GAMMA_) / (GAMMA_ * (2.0 - GAMMA_));
     dir = tend >= *t ? 1.0 : -1.0;
-    if (tend == *t) return TRBDF2_OK;
+    if (fabs(tend - *t) <= 1e-13 * fmax(fabs(tend), 1.0)) { *t = tend; return TRBDF2_OK; }   /* nothing to integrate */
 
     /* rhs at the start (FSAL after an accepted step) */
     if (!m->have_f0) {
@@ -324,13 +326,17 @@ int trbdf2_solve(trbdf2_mem *m, trbdf2_rhs_fn rhs, trbdf2_jac_fn jac, trbdf2_sol
         else { ret = initial_step(m, rhs, user, *t, y, tend, &h); if (ret < 0) { fail(m, "rhs failed during the initial step estimate", *t); return TRBDF2_ERROR_CALLBACK; } }
     }
     if (m->hmax > 0.0) h = fmin(h, m->hmax);
+    if (trace_on()) fprintf(stderr, "solve: t=%.10g tend=%.10g h0=%.3e h_next=%.3e -> h=%.3e hmax=%.3e\n", *t, tend, h0, m->h_next, h, m->hmax);
 
     for (;;) {
         if (m->stats.nsteps >= m->max_steps) { fail(m, "maximum number of steps reached", *t); return TRBDF2_ERROR_MAX_STEPS; }
         /* land exactly on tend */
         last = 0;
         if (dir * (*t + dir * h - tend) >= -1e-10 * fmax(fabs(tend), 1.0)) { h = fabs(tend - *t); last = 1; }
-        if (h < 1e-14 * fmax(fabs(*t), 1.0)) { fail(m, "step size too small", *t); return TRBDF2_ERROR_STEP_TOO_SMALL; }
+        if (h < 1e-14 * fmax(fabs(*t), 1.0)) {
+            if (last) { *t = tend; return TRBDF2_OK; }      /* the remaining segment is roundoff */
+            fail(m, "step size too small", *t); return TRBDF2_ERROR_STEP_TOO_SMALL;
+        }
         m->stats.nsteps++;
         set_scale(m, y);
 
@@ -385,7 +391,7 @@ int trbdf2_solve(trbdf2_mem *m, trbdf2_rhs_fn rhs, trbdf2_jac_fn jac, trbdf2_sol
             fac = m->safety * pow(fmax(errnorm, 1e-10), -0.7 / 3.0) * pow(m->err_prev, 0.4 / 3.0);
         else
             fac = m->safety * pow(fmax(errnorm, 1e-10), -1.0 / 3.0);
-        fac = fmin(m->fac_max, fmax(m->fac_min, fac));
+        fac = fmin(m->first_step ? 1e4 : m->fac_max, fmax(m->fac_min, fac));
 
         if (trace_on()) fprintf(stderr, "  t=%.7f h=%.3e err=%.3g %s newton_iters_so_far=%ld\n", *t, h, errnorm, errnorm > 1.0 ? "REJ" : "acc", m->stats.nnewton);
         if (errnorm > 1.0) {
@@ -400,6 +406,7 @@ int trbdf2_solve(trbdf2_mem *m, trbdf2_rhs_fn rhs, trbdf2_jac_fn jac, trbdf2_sol
         /* ---- accepted */
         m->stats.naccpt++;
         nfail_consec = 0;
+        m->first_step = 0;
         m->err_prev = fmax(errnorm, 1e-10);
         m->steps_since_jac++;
         m->t0 = *t; m->h = dir * h;
