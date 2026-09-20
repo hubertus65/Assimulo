@@ -83,6 +83,7 @@ cdef extern from "arkode/arkode.h":
     int ARKodeSetNonlinear(void* arkode_mem) noexcept
     int ARKodeSetDeduceImplicitRhs(void* arkode_mem, int deduce) noexcept
     int ARKodeSetLSetupFrequency(void* arkode_mem, int msbp) noexcept
+    int ARKodeSetDeltaGammaMax(void* arkode_mem, realtype dgmax) noexcept
     int ARKodeSetPredictorMethod(void* arkode_mem, int method) noexcept
     int ARKodeSetMaxNonlinIters(void* arkode_mem, int maxcor) noexcept
     int ARKodeSetMaxConvFails(void* arkode_mem, int maxncf) noexcept

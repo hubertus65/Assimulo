@@ -239,6 +239,9 @@ class Test_ARKODE:
         sim.nonlin_conv_coef = 0.05
         sim.deduce_implicit_rhs = False
         sim.restart_h = "keep"
+        sim.lsetup_frequency = 5
+        sim.jac_eval_frequency = 10
+        sim.delta_gamma_max = 0.1
         assert sim.predictor == 2 and sim.nonlin_conv_coef == 0.05 and not sim.deduce_implicit_rhs
         sim.verbosity = 50
         sim.simulate(0.01)                # the properties reach ARKODE without an error

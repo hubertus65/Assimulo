@@ -121,6 +121,9 @@ cdef class ARKODE(Explicit_ODE):
         self.options["deduce_implicit_rhs"] = True   # stage derivatives from the stage equations
         self.options["interpolant_degree"] = -1      # -1: ARKODE's default for the method
         self.options["maxncf"] = 10           # max convergence failures per step
+        self.options["lsetup_frequency"] = 20     # steps between linear-solver setups (ARKODE default 20)
+        self.options["jac_eval_frequency"] = 51   # setups between Jacobian evaluations (ARKODE default 51)
+        self.options["delta_gamma_max"] = 0.2     # relative change of gamma that forces a new setup (ARKODE default 0.2)
         self.options["maxnef"] = 7            # max error test failures per step
         self.options["restart_h"] = "estimate"   # after an event: "estimate" a new first step or "keep" the last
         self.options["report_continuously"] = False
@@ -280,6 +283,12 @@ cdef class ARKODE(Explicit_ODE):
             flag = ARK.ARKodeSetDeduceImplicitRhs(self.ark_mem, 1 if self.options["deduce_implicit_rhs"] else 0)
             if flag < 0: raise ARKODEError(flag, self.t)
             flag = ARK.ARKodeSetMaxConvFails(self.ark_mem, int(self.options["maxncf"]))
+            if flag < 0: raise ARKODEError(flag, self.t)
+            flag = ARK.ARKodeSetLSetupFrequency(self.ark_mem, int(self.options["lsetup_frequency"]))
+            if flag < 0: raise ARKODEError(flag, self.t)
+            flag = ARK.ARKodeSetJacEvalFrequency(self.ark_mem, int(self.options["jac_eval_frequency"]))
+            if flag < 0: raise ARKODEError(flag, self.t)
+            flag = ARK.ARKodeSetDeltaGammaMax(self.ark_mem, float(self.options["delta_gamma_max"]))
             if flag < 0: raise ARKODEError(flag, self.t)
 
         # method: a named table, or ARKODE's default table of the requested order. Set once per
@@ -721,6 +730,24 @@ cdef class ARKODE(Explicit_ODE):
     def _get_maxnef(self):
         return self.options["maxnef"]
     maxnef = property(_get_maxnef, _set_maxnef)
+
+    def _set_lsetup_frequency(self, n):
+        self.options["lsetup_frequency"] = int(n)
+    def _get_lsetup_frequency(self):
+        return self.options["lsetup_frequency"]
+    lsetup_frequency = property(_get_lsetup_frequency, _set_lsetup_frequency)
+
+    def _set_jac_eval_frequency(self, n):
+        self.options["jac_eval_frequency"] = int(n)
+    def _get_jac_eval_frequency(self):
+        return self.options["jac_eval_frequency"]
+    jac_eval_frequency = property(_get_jac_eval_frequency, _set_jac_eval_frequency)
+
+    def _set_delta_gamma_max(self, v):
+        self.options["delta_gamma_max"] = float(v)
+    def _get_delta_gamma_max(self):
+        return self.options["delta_gamma_max"]
+    delta_gamma_max = property(_get_delta_gamma_max, _set_delta_gamma_max)
 
     def _set_restart_h(self, v):
         v = str(v).lower()
