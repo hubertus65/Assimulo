@@ -1,5 +1,12 @@
 --- CHANGELOG ---
 --- Assimulo-FUTURE---
+    * New solver `ARKODE` (assimulo.solvers.ARKODE): SUNDIALS ARKODE's ARKStep with a diagonally
+      implicit (orders 2-5) or explicit (orders 2-9) Runge-Kutta table selected by `order` or by
+      name with `table`, Newton with the problem Jacobian (dense) or Jacobian-vector products
+      (SPGMR), ARKODE's rootfinding for state events (or Assimulo's locator with
+      `external_event_detection`), dense output, and ARKodeReset after events. Built when
+      SUNDIALS >= 7.1 with arkode/arkode.h is found; uses only the stepper-independent ARKode*
+      API.
     * New solver `TRBDF2` (assimulo.solvers.TRBDF2): TR-BDF2, a second-order L-stable ESDIRK
       method (Hosea & Shampine 1996) implemented in C with a third-order error estimate filtered
       for stiffness, piecewise cubic Hermite dense output, a CVode-like Jacobian reuse policy,
