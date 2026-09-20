@@ -247,3 +247,82 @@ class Test_ARKODE:
         assert sim.predictor == 2 and sim.nonlin_conv_coef == 0.05 and not sim.deduce_implicit_rhs
         sim.verbosity = 50
         sim.simulate(0.01)                # the properties reach ARKODE without an error
+
+
+def sliding_mode(K=1e4):
+    """A rhs with a jump the solution rides on (an all-or-nothing switch without an event
+    indicator, as in the absorption-plant FMU): pushed up below y1 = 0, pulled down stiffly
+    above it. Newton on the implicit stages fails on a large share of the steps whatever the
+    Jacobian. y2 is smooth: y2 = (cos t + sin t - exp(-t)) / 2."""
+    def f(t, y):
+        return np.array([1.0 if y[0] < 0.0 else -K * y[0] - 1.0, -y[1] + np.cos(t)])
+
+    def jac(t, y):
+        return np.array([[0.0 if y[0] < 0.0 else -K, 0.0], [0.0, -1.0]])
+    mod = Explicit_Problem(f, [-0.5, 0.0])
+    mod.jac = jac
+    return mod
+
+
+class Test_ARKODE_fallback:
+    def _solver(self, **opts):
+        s = ARKODE(sliding_mode())
+        s.rtol = s.atol = 1e-3
+        s.verbosity = 50
+        for k, v in opts.items():
+            setattr(s, k, v)
+        return s
+
+    def test_defaults(self):
+        s = self._solver()
+        assert s.fallback_table == "ARKODE_TRBDF2_3_3_2"
+        assert s.fallback_conv_fail_rate == 0.3
+        assert s.fallback_window == 50
+        assert s.fallback_time is None
+        with pytest.raises(AssimuloException):
+            s.fallback_conv_fail_rate = 1.5
+        with pytest.raises(AssimuloException):
+            s.fallback_window = 0
+        s.fallback_table = None
+        assert s.fallback_table is None
+
+    def test_fallback_triggers_and_continues(self):
+        s = self._solver(fallback_conv_fail_rate=0.2, fallback_window=10)
+        t, y = s.simulate(2.0)
+        assert s.fallback_time is not None and 0.0 < s.fallback_time < 2.0
+        assert s.statistics["nconvfails"] > 0
+        # the smooth state is right; the sliding one has reached the switch and never left it
+        # upwards (above 0 it is pulled down stiffly)
+        assert abs(y[-1, 1] - (np.cos(2.0) + np.sin(2.0) - np.exp(-2.0)) / 2) < 5e-3
+        assert -0.5 < y[-1, 0] < 1e-3
+        assert t[-1] == 2.0
+        # a second simulation starts again from the user's table and falls back again
+        s.reset()
+        s.simulate(2.0)
+        assert s.fallback_time is not None
+
+    def test_fallback_disabled(self):
+        s = self._solver(fallback_conv_fail_rate=0.2, fallback_window=10, fallback_table=None)
+        t, y = s.simulate(2.0)
+        assert s.fallback_time is None
+        assert abs(y[-1, 1] - (np.cos(2.0) + np.sin(2.0) - np.exp(-2.0)) / 2) < 5e-3
+
+    def test_no_fallback_on_a_smooth_problem(self):
+        s = ARKODE(vanderpol())
+        s.verbosity = 50
+        s.simulate(2.0)
+        assert s.fallback_time is None
+
+    def test_fallback_with_output_points(self):
+        # ARK_NORMAL mode: the rate is checked at the communication points over at least
+        # 'fallback_window' attempts, so the failures near the switch are diluted -- lower threshold
+        s = self._solver(fallback_conv_fail_rate=0.1, fallback_window=10)
+        t, y = s.simulate(2.0, 400)
+        assert len(t) == 401
+        assert s.fallback_time is not None
+        assert abs(y[-1, 1] - (np.cos(2.0) + np.sin(2.0) - np.exp(-2.0)) / 2) < 5e-3
+
+    def test_fallback_not_for_the_fallback_table(self):
+        s = self._solver(fallback_conv_fail_rate=0.2, fallback_window=10, table="ARKODE_TRBDF2_3_3_2")
+        s.simulate(2.0)
+        assert s.fallback_time is None
