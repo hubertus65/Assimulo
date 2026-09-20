@@ -1,5 +1,5 @@
 py.install_sources(['__init__.py', 'dasp3.py', 'glimda.py', 'odassl.py', 'odepack.py', 'radar5.py', 'radau5.py',
-                    'rosenbrock.py', 'runge_kutta.py'], subdir: pkg / 'solvers')
+                    'rosenbrock.py', 'runge_kutta.py', 'trbdf2.py'], subdir: pkg / 'solvers')
 
 # Euler
 euler_c = custom_target('euler_cython', input: stage['solvers/euler.pyx'], output: 'euler.c',
