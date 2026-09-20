@@ -9,6 +9,9 @@
       API. A failure-rate fallback (`fallback_table`, `fallback_conv_fail_rate`,
       `fallback_window`) continues with a 2-stage table when Newton fails on most steps of a
       many-stage method, as happens on a rhs with a state-dependent jump and no event indicator.
+      `method = "symplectic"` runs SPRKStep (symplectic partitioned RK, orders 1-6, 8, 10) at a
+      fixed step `fixed_h` on a separable system whose position states are named by `q_states`;
+      the problem's rhs is evaluated twice per stage and masked into f1/f2.
       The dense-output interpolant defaults to degree 3 (`interpolant_degree`): ARKODE's own
       default, the method order, costs extra rhs evaluations at every output point at order 5
       and reports spurious events through the quintic Hermite interpolant under rootfinding.

@@ -48,6 +48,33 @@ include "../lib/sundials_callbacks.pxi"          # arr2nv, nv2arr
 include "../lib/sundials_callbacks_ida_cvode.pxi" # cv_rhs, cv_jac, cv_jacv, cv_root, cv_err, ProblemData
 
 
+cdef int sprk_f1(realtype t, N_Vector yv, N_Vector yvdot, void* problem_data) noexcept:
+    """SPRKStep's f1: the momentum-state part of the rhs (the position part zeroed)."""
+    cdef ProblemData pData = <ProblemData>problem_data
+    cdef int flag = cv_rhs(t, yv, yvdot, problem_data)
+    cdef np.ndarray[double, ndim=1, mode="c"] mask = pData.sprk_qmask
+    cdef realtype* d = (<N_VectorContent_Serial>yvdot.content).data
+    cdef int i
+    if flag == 0:
+        for i in range(pData.dim):
+            if mask[i] != 0.0:
+                d[i] = 0.0
+    return flag
+
+cdef int sprk_f2(realtype t, N_Vector yv, N_Vector yvdot, void* problem_data) noexcept:
+    """SPRKStep's f2: the position-state part of the rhs (the momentum part zeroed)."""
+    cdef ProblemData pData = <ProblemData>problem_data
+    cdef int flag = cv_rhs(t, yv, yvdot, problem_data)
+    cdef np.ndarray[double, ndim=1, mode="c"] mask = pData.sprk_qmask
+    cdef realtype* d = (<N_VectorContent_Serial>yvdot.content).data
+    cdef int i
+    if flag == 0:
+        for i in range(pData.dim):
+            if mask[i] == 0.0:
+                d[i] = 0.0
+    return flag
+
+
 
 cdef class ARKODE(Explicit_ODE):
     r"""
@@ -61,7 +88,11 @@ cdef class ARKODE(Explicit_ODE):
     table (orders 2-5, L-stable ones at every order), Newton iteration and a direct
     dense linear solver with the problem's Jacobian if ``usejac``;
     ``method = "explicit"`` runs an explicit RK table (orders 2-9) without any
-    linear algebra. The table is chosen by ``order`` (ARKODE's default table of that
+    linear algebra; ``method = "symplectic"`` runs SPRKStep, a symplectic
+    partitioned RK method (orders 1-6, 8, 10) for separable Hamiltonian systems
+    at a fixed step ``fixed_h``: the states listed in ``q_states`` are the
+    positions (their derivatives are the momenta), the rest the momenta; the
+    problem's rhs is evaluated twice per stage and masked. The table is chosen by ``order`` (ARKODE's default table of that
     order) or by name with ``table`` (e.g. ``"ARKODE_TRBDF2_3_3_2"``,
     ``"ARKODE_ESDIRK324L2SA_4_2_3"``, ``"ARKODE_DORMAND_PRINCE_7_4_5"``).
 
@@ -129,7 +160,10 @@ cdef class ARKODE(Explicit_ODE):
         self.options["maxkrylov"] = 5
         self.options["external_event_detection"] = False   # ARKODE rootfinding by default
         # ARKODE-specific
-        self.options["method"] = "implicit"   # "implicit" (DIRK) or "explicit" (ERK)
+        self.options["method"] = "implicit"   # "implicit" (DIRK), "explicit" (ERK) or "symplectic" (SPRK)
+        self.options["q_states"] = None       # symplectic: indices (or a boolean mask) of the position states
+        self.options["fixed_h"] = 0.0         # symplectic: the fixed step size (SPRKStep has no adaptivity)
+        self.options["compensated_sums"] = False   # symplectic: Kahan-compensated stage sums
         self.options["order"] = 4             # method order when 'table' is None
         self.options["table"] = None          # Butcher table name, overrides 'order'
         self.options["predictor"] = 2         # ARKODE predictor 0-5; 0 (y_n) needs 2.4x the steps on Van der Pol, 2 (variable-order) halves the Newton failures of 1 on the data-center FMU
@@ -248,8 +282,10 @@ cdef class ARKODE(Explicit_ODE):
         """Creates the ARKODE memory on the first call, resets it to (t, y) afterwards."""
         cdef int flag
         method = self.options["method"]
-        if method not in ("implicit", "explicit"):
-            raise ARKODEError(ARK_ILL_INPUT, self.t, "'method' must be 'implicit' or 'explicit'")
+        if method not in ("implicit", "explicit", "symplectic"):
+            raise ARKODEError(ARK_ILL_INPUT, self.t, "'method' must be 'implicit', 'explicit' or 'symplectic'")
+        if method == "symplectic":
+            self.pData.sprk_qmask = self._q_mask()
 
         if self.yTemp != NULL:
             N_VDestroy(self.yTemp)
@@ -265,8 +301,10 @@ cdef class ARKODE(Explicit_ODE):
         if self.ark_mem == NULL:
             if method == "implicit":
                 self.ark_mem = ARK.ARKStepCreate(NULL, cv_rhs, self.t, self.yTemp, self.ctx)
-            else:
+            elif method == "explicit":
                 self.ark_mem = ARK.ARKStepCreate(cv_rhs, NULL, self.t, self.yTemp, self.ctx)
+            else:
+                self.ark_mem = ARK.SPRKStepCreate(sprk_f1, sprk_f2, self.t, self.yTemp, self.ctx)
             if self.ark_mem == NULL:
                 raise ARKODEError(ARK_MEM_FAIL, self.t)
             self._created_method = method
@@ -293,6 +331,23 @@ cdef class ARKODE(Explicit_ODE):
             flag = ARK.ARKodeSetUserData(self.ark_mem, <void*>self.pData)
             if flag < 0:
                 raise ARKODEError(flag, self.t)
+
+    def _q_mask(self):
+        """The position-state mask (1.0 / 0.0 per state) from the 'q_states' option."""
+        q = self.options["q_states"]
+        if q is None:
+            raise AssimuloException("ARKODE symplectic: 'q_states' (the indices of the position states) must be set.")
+        q = np.asarray(q)
+        mask = np.zeros(self.pData.dim)
+        if q.dtype == bool:
+            if len(q) != self.pData.dim:
+                raise AssimuloException("ARKODE symplectic: a boolean 'q_states' must have one entry per state.")
+            mask[q] = 1.0
+        else:
+            mask[q.astype(int)] = 1.0
+        if mask.sum() == 0 or mask.sum() == self.pData.dim:
+            raise AssimuloException("ARKODE symplectic: 'q_states' must name some but not all states.")
+        return np.ascontiguousarray(mask)
 
     cdef int _switch_table(self, double t, np.ndarray y, double tf, table) except -1:
         """Recreates the memory block with `table` at (t, y), keeping the last step size."""
@@ -426,8 +481,10 @@ cdef class ARKODE(Explicit_ODE):
                 tname = str(table).encode("ascii")
                 if method == "implicit":
                     flag = ARK.ARKStepSetTableName(self.ark_mem, tname, b"ARKODE_ERK_NONE")
-                else:
+                elif method == "explicit":
                     flag = ARK.ARKStepSetTableName(self.ark_mem, b"ARKODE_DIRK_NONE", tname)
+                else:
+                    flag = ARK.SPRKStepSetMethodName(self.ark_mem, tname)
                 if flag < 0:
                     raise ARKODEError(flag, self.t, "unknown Butcher table '%s'" % table)
             else:
@@ -438,6 +495,18 @@ cdef class ARKODE(Explicit_ODE):
                 flag = ARK.ARKodeSetInterpolantDegree(self.ark_mem, int(self.options["interpolant_degree"]))
                 if flag < 0: raise ARKODEError(flag, self.t)
             self._fresh_memory = 0
+
+        if method == "symplectic":
+            # SPRKStep: no adaptivity, a fixed step, no tolerances (the rootfinding needs none)
+            if float(self.options["fixed_h"]) <= 0.0:
+                raise AssimuloException("ARKODE symplectic: 'fixed_h' (the fixed step size) must be positive.")
+            flag = ARK.ARKodeSetFixedStep(self.ark_mem, float(self.options["fixed_h"]))
+            if flag < 0: raise ARKODEError(flag, self.t)
+            flag = ARK.ARKodeSetUseCompensatedSums(self.ark_mem, 1 if self.options["compensated_sums"] else 0)
+            if flag < 0: raise ARKODEError(flag, self.t)
+            flag = ARK.ARKodeSetMaxNumSteps(self.ark_mem, int(self.options["maxsteps"]))
+            if flag < 0: raise ARKODEError(flag, self.t)
+            return
 
         # step-size adaptivity bounds
         flag = ARK.ARKodeSetSafetyFactor(self.ark_mem, float(self.options["safety"]))
@@ -774,6 +843,24 @@ cdef class ARKODE(Explicit_ODE):
         return self.options["maxsteps"]
     maxsteps = property(_get_maxsteps, _set_maxsteps)
 
+    def _set_q_states(self, q):
+        self.options["q_states"] = None if q is None else np.asarray(q)
+    def _get_q_states(self):
+        return self.options["q_states"]
+    q_states = property(_get_q_states, _set_q_states)
+
+    def _set_fixed_h(self, h):
+        self.options["fixed_h"] = float(h)
+    def _get_fixed_h(self):
+        return self.options["fixed_h"]
+    fixed_h = property(_get_fixed_h, _set_fixed_h)
+
+    def _set_compensated_sums(self, b):
+        self.options["compensated_sums"] = bool(b)
+    def _get_compensated_sums(self):
+        return self.options["compensated_sums"]
+    compensated_sums = property(_get_compensated_sums, _set_compensated_sums)
+
     def _set_fallback_table(self, table):
         self.options["fallback_table"] = str(table) if table else None
     def _get_fallback_table(self):
@@ -832,8 +919,8 @@ cdef class ARKODE(Explicit_ODE):
 
     def _set_method(self, m):
         m = str(m).lower()
-        if m not in ("implicit", "explicit"):
-            raise AssimuloException("'method' must be 'implicit' or 'explicit'.")
+        if m not in ("implicit", "explicit", "symplectic"):
+            raise AssimuloException("'method' must be 'implicit', 'explicit' or 'symplectic'.")
         if m != self.options["method"]:
             self._free_memory()
         self.options["method"] = m

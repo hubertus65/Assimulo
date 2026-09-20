@@ -843,6 +843,7 @@ cdef class ProblemData:
         int memSizeJac     #dim*dim*sizeof(realtype) used when copying memory
         int verbose        #Defines the verbosity
         long int nrhsfails #Number of recoverable failures returned by the rhs callback (an exception in the problem's rhs)
+        np.ndarray sprk_qmask #Symplectic split (ARKODE SPRKStep): 1.0 for a position state, 0.0 for a momentum state
         object PREC_DATA   #Arbitrary data from the preconditioner
         np.ndarray work_y
         np.ndarray work_yd

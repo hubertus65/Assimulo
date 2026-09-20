@@ -78,6 +78,7 @@ cdef extern from "arkode/arkode.h":
     int ARKodeSetStopTime(void* arkode_mem, realtype tstop) noexcept
     int ARKodeClearStopTime(void* arkode_mem) noexcept
     int ARKodeSetFixedStep(void* arkode_mem, realtype hfixed) noexcept
+    int ARKodeSetUseCompensatedSums(void* arkode_mem, int onoff) noexcept
     int ARKodeSetUserData(void* arkode_mem, void* user_data) noexcept
     int ARKodeSetLinear(void* arkode_mem, int timedepend) noexcept
     int ARKodeSetNonlinear(void* arkode_mem) noexcept
@@ -136,6 +137,10 @@ cdef extern from "arkode/arkode_arkstep.h":
     void* ARKStepCreate(ARKRhsFn fe, ARKRhsFn fi, realtype t0, N_Vector y0, SUNContext sunctx) noexcept
     int ARKStepReInit(void* arkode_mem, ARKRhsFn fe, ARKRhsFn fi, realtype t0, N_Vector y0) noexcept
     int ARKStepSetTableName(void* arkode_mem, const char* itable, const char* etable) noexcept
+
+cdef extern from "arkode/arkode_sprkstep.h":
+    void* SPRKStepCreate(ARKRhsFn f1, ARKRhsFn f2, realtype t0, N_Vector y0, SUNContext sunctx) noexcept
+    int SPRKStepSetMethodName(void* arkode_mem, const char* method) noexcept
 
 cdef extern from "arkode/arkode_erkstep.h":
     void* ERKStepCreate(ARKRhsFn f, realtype t0, N_Vector y0, SUNContext sunctx) noexcept

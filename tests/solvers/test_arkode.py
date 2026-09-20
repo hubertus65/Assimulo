@@ -326,3 +326,74 @@ class Test_ARKODE_fallback:
         s = self._solver(fallback_conv_fail_rate=0.2, fallback_window=10, table="ARKODE_TRBDF2_3_3_2")
         s.simulate(2.0)
         assert s.fallback_time is None
+
+
+def kepler(e=0.3):
+    """y = [q1, q2, p1, p2], H = |p|^2/2 - 1/|q|; a separable Hamiltonian system."""
+    def f(t, y):
+        q1, q2, p1, p2 = y
+        r3 = (q1 * q1 + q2 * q2) ** 1.5
+        return np.array([p1, p2, -q1 / r3, -q2 / r3])
+    return Explicit_Problem(f, [1 - e, 0.0, 0.0, np.sqrt((1 + e) / (1 - e))])
+
+
+def energy(y):
+    return 0.5 * (y[:, 2]**2 + y[:, 3]**2) - 1 / np.sqrt(y[:, 0]**2 + y[:, 1]**2)
+
+
+class Test_ARKODE_symplectic:
+    def test_options(self):
+        s = ARKODE(kepler())
+        s.method = "symplectic"
+        assert s.method == "symplectic"
+        with pytest.raises(AssimuloException):
+            s.simulate(1.0)                 # q_states missing
+        s.q_states = [0, 1]
+        with pytest.raises(AssimuloException):
+            s.simulate(1.0)                 # fixed_h missing
+        s.fixed_h = 0.01
+        s.q_states = [0, 1, 2, 3]
+        with pytest.raises(AssimuloException):
+            s.simulate(1.0)                 # all states positions
+        s.q_states = np.array([True, True, False, False])
+        s.verbosity = 50
+        t, y = s.simulate(1.0)
+        assert t[-1] == 1.0
+
+    def test_energy_is_conserved(self):
+        """Over 100 orbits the symplectic method's energy error stays bounded at the level of
+        one step's truncation error; the explicit RK at the same step count drifts."""
+        tf = 100 * 2 * np.pi
+        s = ARKODE(kepler()); s.method = "symplectic"; s.order = 4; s.q_states = [0, 1]; s.fixed_h = 0.02; s.verbosity = 50
+        s.maxsteps = 10**6
+        t, y = s.simulate(tf, 1000)
+        dH = np.abs(energy(y) - energy(y[:1]))
+        assert dH.max() < 1e-5
+        assert dH[-100:].max() < 2 * dH[:100].max()      # no drift
+        assert s.statistics["nfcns"] == 2 * 4 * s.statistics["nsteps"]   # 4 stages, f1 and f2 each a full rhs
+
+    def test_tables_and_orders(self):
+        for order, table in ((2, None), (6, None), (None, "ARKODE_SPRK_MCLACHLAN_4_4"), (None, "ARKODE_SPRK_YOSHIDA_6_8")):
+            s = ARKODE(kepler()); s.method = "symplectic"; s.q_states = [0, 1]; s.fixed_h = 0.01; s.verbosity = 50
+            if order: s.order = order
+            if table: s.table = table
+            t, y = s.simulate(2 * np.pi, 100)
+            assert np.abs(energy(y) - energy(y[:1])).max() < (1e-3 if order == 2 else 1e-6), (order, table)
+        s = ARKODE(kepler()); s.method = "symplectic"; s.q_states = [0, 1]; s.fixed_h = 0.01; s.table = "ARKODE_SPRK_NO_SUCH"
+        with pytest.raises(ARKODEError):
+            s.simulate(1.0)
+
+    def test_state_event(self):
+        """A pendulum-like oscillator whose position crossing zero is an event; the rootfinding
+        works on SPRKStep's interpolant and the run restarts on the fixed step."""
+        def f(t, y, sw):
+            return np.array([y[1], -y[0]])
+        def g(t, y, sw):
+            return np.array([y[0]])
+        def handle(solver, info):
+            solver.sw[0] = not solver.sw[0]
+        mod = Explicit_Problem(f, [1.0, 0.0], sw0=[True]); mod.state_events = g; mod.handle_event = handle
+        s = ARKODE(mod); s.method = "symplectic"; s.q_states = [0]; s.fixed_h = 0.01; s.verbosity = 50
+        t, y = s.simulate(3 * np.pi, 300)
+        assert s.statistics["nstateevents"] == 3
+        assert abs(y[-1, 0] - np.cos(3 * np.pi)) < 1e-3
