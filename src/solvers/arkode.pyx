@@ -551,7 +551,10 @@ cdef class ARKODE(Explicit_ODE):
                "njacs": njevals, "njacvecs": njvevals, "nfcnjacs": nfevalsLS, "nstatefcns": ngevals}
         last = self._last_counters
         for key, val in cur.items():
-            self.statistics[key] += val - last.get(key, 0)
+            prev = last.get(key, 0)
+            if val < prev:
+                prev = 0                 # ARKodeReset zeroes some counters (the root evaluations)
+            self.statistics[key] += val - prev
         self._last_counters = cur
         if return_flag == ARK_ROOT_RETURN and not self.options["external_event_detection"]:
             self.statistics["nstateevents"] += 1
