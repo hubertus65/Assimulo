@@ -64,13 +64,14 @@ superlu_inc = []
 if superlu_home != ''
   # layouts: a SuperLU_MT source tree (SRC/), an install prefix (include/), or a conda-forge
   # prefix whose sundials package ships the library (include/superlu_mt/, lib/)
+  # (slu_mt_ddefs.h is specific to SuperLU_MT; supermatrix.h also exists in plain SuperLU)
   superlu_incdir = superlu_home / 'SRC'
   foreach cand : [superlu_home / 'include', superlu_home / 'include' / 'superlu_mt']
-    if not fs.exists(superlu_incdir / 'supermatrix.h')
+    if not fs.exists(superlu_incdir / 'slu_mt_ddefs.h')
       superlu_incdir = cand
     endif
   endforeach
-  if fs.exists(superlu_incdir / 'supermatrix.h')
+  if fs.exists(superlu_incdir / 'slu_mt_ddefs.h')
     have_superlu = true
     superlu_inc = include_directories(superlu_incdir)
     superlu_libdir = superlu_home / 'lib'
@@ -78,7 +79,7 @@ if superlu_home != ''
                     cc.find_library('blas_OPENMP', dirs: [superlu_libdir], required: false)]
     message('SuperLU_MT found in ' + superlu_home)
   else
-    warning('SuperLU_MT not found under ' + superlu_home + ' (no supermatrix.h): sparse solvers disabled')
+    warning('SuperLU_MT not found under ' + superlu_home + ' (no slu_mt_ddefs.h): sparse solvers disabled')
   endif
 endif
 
