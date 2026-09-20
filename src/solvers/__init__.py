@@ -16,7 +16,7 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 __all__ = ["euler","radau5","sundials","runge_kutta","rosenbrock",
-           "glimda","odepack","radar5","dasp3","odassl"]
+           "glimda","odepack","radar5","dasp3","odassl","trbdf2","arkode"]
 
 import sys
 
