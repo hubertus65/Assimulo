@@ -215,11 +215,32 @@ class Test_ARKODE:
         assert y[-1][0] == pytest.approx(np.exp(-1.0), abs=1e-5)
 
     def test_maxsteps(self):
+        """maxsteps applies per ARKodeEvolve call: between output points in normal mode (as
+        CVode's mxstep), never in one-step mode (report_continuously, PyFMI's mode)."""
         sim = ARKODE(vanderpol())
         sim.verbosity = 50
         sim.maxsteps = 5
         with pytest.raises(ARKODEError, match="maximum number of internal steps"):
-            sim.simulate(2.0)
+            sim.simulate(2.0, 2)
+        sim = ARKODE(vanderpol())
+        sim.verbosity = 50
+        sim.maxsteps = 5
+        sim.report_continuously = True
+        t, y = sim.simulate(2.0, 2)
+        assert sim.statistics["nsteps"] > 5
+
+    def test_step_event_without_state_events(self):
+        """A step event (handle_result asks for a reinitialization) on a problem with no event
+        indicators: no rootfinding to ask for the event info."""
+        mod = Explicit_Problem(lambda t, y: np.array([-y[0]]), [1.0])
+        calls = []
+        def step_events(solver):
+            calls.append(solver.t)
+            return 1 if len(calls) == 3 else 0
+        mod.step_events = step_events
+        sim = ARKODE(mod); sim.verbosity = 50; sim.report_continuously = True
+        t, y = sim.simulate(1.0)
+        assert abs(y[-1, 0] - np.exp(-1.0)) < 1e-5
 
     def test_options_validation(self):
         sim = ARKODE(vanderpol())

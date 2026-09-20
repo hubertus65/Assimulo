@@ -588,13 +588,9 @@ cdef class ARKODE(Explicit_ODE):
                     self.store_statistics(ARK_TSTOP_RETURN)
                     N_VDestroy(yout)
                     raise ARKODEError(flag, tret)
-                # ARKODE's maxsteps counts per ARKodeEvolve call; in one-step mode enforce it per
-                # integrate call, as CVode's mxstep does for a call in normal mode
+                # ARKODE's maxsteps counts per ARKodeEvolve call, i.e. per step here -- as CVode's
+                # mxstep in the same one-step mode, so no limit applies between output points
                 nsteps_call += 1
-                if nsteps_call > int(self.options["maxsteps"]):
-                    self.store_statistics(ARK_TSTOP_RETURN)
-                    N_VDestroy(yout)
-                    raise ARKODEError(ARK_TOO_MUCH_WORK, tret)
 
                 t = tret
                 y = nv2arr(yout)
@@ -688,6 +684,8 @@ cdef class ARKODE(Explicit_ODE):
     cpdef state_event_info(self):
         if self.options["external_event_detection"]:
             return self._event_info
+        if self.pData.dimRoot == 0:
+            return []           # a step event of a problem without state events: no rootfinding to ask
         cdef int* c_info
         cdef int flag
         c_info = <int*>malloc(self.pData.dimRoot * sizeof(int))
