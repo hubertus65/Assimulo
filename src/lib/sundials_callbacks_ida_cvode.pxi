@@ -823,6 +823,8 @@ ELSE:
 cdef class ProblemData:
     cdef:
         void *RHS          #Should store the residual or the right-hand-side
+        void *RHS_I        #ARKODE imex: the implicit part of the rhs (problem.rhs_implicit)
+        void *RHS_E        #ARKODE imex: the explicit part of the rhs (problem.rhs_explicit)
         void *RHS_SENS_ALL #Should store the sensitivty equation of all parameters
         void *ROOT         #Should store the root function
         void *JAC          #Should store the jacobian

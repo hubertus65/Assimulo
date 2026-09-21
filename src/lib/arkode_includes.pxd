@@ -24,10 +24,26 @@ stepper-specific creation and Butcher-table selection calls are the exception.
 The vector, matrix, linear-solver and context types come from sundials_includes.
 """
 
-from sundials_includes cimport realtype, N_Vector, SUNMatrix, SUNLinearSolver, SUNContext
+from sundials_includes cimport realtype, N_Vector, SUNMatrix, SUNLinearSolver, SUNContext, sunindextype
 
 cdef extern from "sundials/sundials_context.h":
     int SUNContext_Free(SUNContext* ctx) noexcept
+
+# a custom SUNLinearSolver (the block-diagonal direct solver of ARKODE.linear_solver = "BLOCK")
+cdef extern from "sundials/sundials_linearsolver.h":
+    SUNLinearSolver SUNLinSolNewEmpty(SUNContext ctx) noexcept
+    void SUNLinSolFreeEmpty(SUNLinearSolver S) noexcept
+
+# SUNDIALS' own dense LU (what SUNLinSol_Dense uses), on column-pointer matrices
+cdef extern from "sundials/sundials_direct.h":
+    realtype** SUNDlsMat_newDenseMat(sunindextype m, sunindextype n) noexcept
+    void SUNDlsMat_destroyMat(realtype** a) noexcept
+    sunindextype* SUNDlsMat_newIndexArray(sunindextype n) noexcept
+    void SUNDlsMat_destroyArray(void* v) noexcept
+
+cdef extern from "sundials/sundials_dense.h":
+    sunindextype SUNDlsMat_denseGETRF(realtype** a, sunindextype m, sunindextype n, sunindextype* p) noexcept
+    void SUNDlsMat_denseGETRS(realtype** a, sunindextype n, sunindextype* p, realtype* b) noexcept
 
 cdef extern from "arkode/arkode.h":
     # itask

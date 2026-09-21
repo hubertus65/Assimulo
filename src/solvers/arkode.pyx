@@ -17,7 +17,8 @@
 
 """
 ARKODE (SUNDIALS) as an Assimulo solver: adaptive one-step Runge-Kutta methods,
-implicit (DIRK/ESDIRK) or explicit, with ARKODE's rootfinding for state events.
+implicit (DIRK/ESDIRK), explicit, additive implicit-explicit (IMEX) or symplectic,
+with ARKODE's rootfinding for state events.
 Requires SUNDIALS >= 7.1 (the stepper-independent ARKode* API).
 """
 
@@ -30,6 +31,9 @@ from assimulo.support import set_type_shape_array
 
 cimport sundials_includes as SUNDIALS
 cimport arkode_includes as ARK
+from arkode_includes cimport (SUNLinSolNewEmpty, SUNLinSolFreeEmpty, SUNDlsMat_newDenseMat, SUNDlsMat_destroyMat,
+                              SUNDlsMat_newIndexArray, SUNDlsMat_destroyArray, SUNDlsMat_denseGETRF,
+                              SUNDlsMat_denseGETRS)
 from arkode_includes cimport (ARK_NORMAL, ARK_ONE_STEP, ARK_SUCCESS, ARK_TSTOP_RETURN, ARK_ROOT_RETURN,
                               ARK_TOO_MUCH_WORK, ARK_TOO_MUCH_ACC, ARK_ERR_FAILURE, ARK_CONV_FAILURE,
                               ARK_LINIT_FAIL, ARK_LSETUP_FAIL, ARK_LSOLVE_FAIL, ARK_RHSFUNC_FAIL,
@@ -41,11 +45,272 @@ from sundials_includes cimport N_Vector, realtype, N_VectorContent_Serial, DENSE
 from sundials_includes cimport memcpy, N_VNew_Serial, DlsMat, SUNMatrix, SUNMatrixContent_Dense, SUNMatrixContent_Sparse
 from sundials_includes cimport malloc, free, N_VConst_Serial
 from sundials_includes cimport N_VCloneVectorArray, N_VDestroy
+from sundials_includes cimport SUNLinearSolver, SUNMatrix, N_VectorContent_Serial
 
 include "constants.pxi"                          # Assimulo's ID_* flags
 include "../lib/sundials_constants.pxi"
 include "../lib/sundials_callbacks.pxi"          # arr2nv, nv2arr
 include "../lib/sundials_callbacks_ida_cvode.pxi" # cv_rhs, cv_jac, cv_jacv, cv_root, cv_err, ProblemData
+
+
+cdef inline int ark_rhs_part(object fn, realtype t, N_Vector yv, N_Vector yvdot, ProblemData pData) noexcept:
+    """One part of an additive rhs (`fn` is problem.rhs_implicit or problem.rhs_explicit),
+    with cv_rhs's calling convention and failure codes."""
+    cdef np.ndarray y = pData.work_y
+    cdef realtype* resptr = (<N_VectorContent_Serial>yvdot.content).data
+    cdef int i
+    nv2arr_inplace(yv, y)
+    try:
+        if pData.sw != NULL:
+            rhs = fn(t, y, <list>pData.sw)
+        else:
+            rhs = fn(t, y)
+    except Exception:
+        pData.nrhsfails += 1
+        return CV_REC_ERR
+    except BaseException:
+        return CV_UNREC_RHSFUNC_ERR
+    for i in range(pData.dim):
+        resptr[i] = rhs[i]
+    return CV_SUCCESS
+
+cdef int ark_rhs_implicit(realtype t, N_Vector yv, N_Vector yvdot, void* problem_data) noexcept:
+    """ARKStep's fi: problem.rhs_implicit (imex)."""
+    cdef ProblemData pData = <ProblemData>problem_data
+    return ark_rhs_part(<object>pData.RHS_I, t, yv, yvdot, pData)
+
+cdef int ark_rhs_explicit(realtype t, N_Vector yv, N_Vector yvdot, void* problem_data) noexcept:
+    """ARKStep's fe: problem.rhs_explicit (imex)."""
+    cdef ProblemData pData = <ProblemData>problem_data
+    return ark_rhs_part(<object>pData.RHS_E, t, yv, yvdot, pData)
+
+
+# ---------------------------------------------------------------------------------------------
+# The block-diagonal direct linear solver (ARKODE.linear_solver = "BLOCK")
+#
+# ARKLS forms the Newton matrix A = I - gamma*J in a dense SUNMatrix and calls setup/solve on
+# it. When the implicit part's states fall into blocks whose derivatives do not depend on each
+# other's states (several fast subsystems that only talk to each other through the explicit
+# part: a vehicle body with its suspensions), the rows of A are, after ordering,
+#     identity rows for the states outside the blocks (their implicit rhs is zero),
+#     one dense block A_BB per block, plus the columns A_BS coupling it to the outside states.
+# The solve is then x_S = b_S and, per block, A_BB x_B = b_B - A_BS x_S: the dense LU's result
+# to rounding, at sum(n_b^3) instead of n^3. The structure is the problem's claim
+# (problem.implicit_blocks); every setup checks it against the matrix it is given.
+
+cdef class BlockLU:
+    """Content of the BLOCK SUNLinearSolver: the block index sets and their LU factors."""
+    cdef int n, nblocks, nout, check
+    cdef double check_tol
+    cdef sunindextype* bstart      # block b holds bidx[bstart[b] : bstart[b+1]]
+    cdef sunindextype* bidx        # the state indices of all blocks, block by block
+    cdef sunindextype* sidx        # the state indices outside every block (the "outside" set S)
+    cdef sunindextype* block_of    # state -> block number, -1 outside
+    cdef realtype*** lu            # per block: SUNDlsMat_newDenseMat(n_b, n_b), LU-factored in setup
+    cdef sunindextype** piv        # per block: the pivots
+    cdef realtype* work            # max block size
+    cdef public object blocks      # the index arrays as given (validated), for comparisons
+    cdef public object message     # the structure check's complaint, None if none
+    cdef public long int last_flag
+    cdef public long int nsetups, nsolves
+
+    def __cinit__(self):
+        self.bstart = NULL; self.bidx = NULL; self.sidx = NULL; self.block_of = NULL
+        self.lu = NULL; self.piv = NULL; self.work = NULL
+        self.nblocks = 0
+
+    def __init__(self, blocks, int n, int cover_all, int check, double check_tol):
+        cdef int b, k, i, nb, maxnb = 0
+        used = np.zeros(n, dtype=bool)
+        arrays = []
+        for b, blk in enumerate(blocks):
+            a = np.asarray(blk)
+            if a.dtype == bool:
+                if len(a) != n:
+                    raise AssimuloException("ARKODE BLOCK: a boolean block mask must have one entry per state (block %d)." % b)
+                a = np.flatnonzero(a)
+            a = np.unique(a.astype(np.int64))
+            if len(a) == 0:
+                raise AssimuloException("ARKODE BLOCK: block %d is empty." % b)
+            if a[0] < 0 or a[-1] >= n:
+                raise AssimuloException("ARKODE BLOCK: block %d has an index outside 0..%d." % (b, n - 1))
+            if used[a].any():
+                raise AssimuloException("ARKODE BLOCK: block %d overlaps an earlier block." % b)
+            used[a] = True
+            arrays.append(a)
+        if not arrays:
+            raise AssimuloException("ARKODE BLOCK: 'implicit_blocks' is empty.")
+        if cover_all and not used.all():
+            raise AssimuloException("ARKODE BLOCK: with method = 'implicit' the blocks must cover every state "
+                                    "(%d of %d are outside); states outside the blocks are only allowed "
+                                    "for method = 'imex', where their implicit rhs is zero." % ((~used).sum(), n))
+        self.blocks = arrays
+        self.n = n
+        self.nblocks = len(arrays)
+        self.check = check
+        self.check_tol = check_tol
+        self.message = None
+        self.last_flag = 0
+        self.nsetups = 0
+        self.nsolves = 0
+        self.bstart = SUNDlsMat_newIndexArray(self.nblocks + 1)
+        self.bidx = SUNDlsMat_newIndexArray(max(1, int(used.sum())))
+        outside = np.flatnonzero(~used)
+        self.nout = len(outside)
+        self.sidx = SUNDlsMat_newIndexArray(max(1, self.nout))
+        self.block_of = SUNDlsMat_newIndexArray(n)
+        self.lu = <realtype***>malloc(self.nblocks * sizeof(realtype**))
+        self.piv = <sunindextype**>malloc(self.nblocks * sizeof(sunindextype*))
+        for i in range(n):
+            self.block_of[i] = -1
+        for i in range(self.nout):
+            self.sidx[i] = outside[i]
+        k = 0
+        for b in range(self.nblocks):
+            self.bstart[b] = k
+            nb = len(arrays[b])
+            for i in range(nb):
+                self.bidx[k] = arrays[b][i]
+                self.block_of[arrays[b][i]] = b
+                k += 1
+            self.lu[b] = SUNDlsMat_newDenseMat(nb, nb)
+            self.piv[b] = SUNDlsMat_newIndexArray(nb)
+            if nb > maxnb: maxnb = nb
+        self.bstart[self.nblocks] = k
+        self.work = <realtype*>malloc(maxnb * sizeof(realtype))
+
+    def __dealloc__(self):
+        cdef int b
+        if self.lu != NULL:
+            for b in range(self.nblocks):
+                if self.lu[b] != NULL: SUNDlsMat_destroyMat(self.lu[b])
+            free(self.lu)
+        if self.piv != NULL:
+            for b in range(self.nblocks):
+                if self.piv[b] != NULL: SUNDlsMat_destroyArray(self.piv[b])
+            free(self.piv)
+        if self.bstart != NULL: SUNDlsMat_destroyArray(self.bstart)
+        if self.bidx != NULL: SUNDlsMat_destroyArray(self.bidx)
+        if self.sidx != NULL: SUNDlsMat_destroyArray(self.sidx)
+        if self.block_of != NULL: SUNDlsMat_destroyArray(self.block_of)
+        if self.work != NULL: free(self.work)
+
+    def sizes(self):
+        return [len(a) for a in self.blocks]
+
+    cdef int setup(self, SUNMatrix A) noexcept:
+        """Copies each diagonal block out of the dense A = I - gamma*J and LU-factors it; with
+        `check`, first verifies that A has the declared structure. Returns 0, +1 for a singular
+        block (recoverable: ARKODE retries with a smaller step), -1 for a structure violation."""
+        cdef SUNDIALS.SUNMatrixContent_Dense c = <SUNDIALS.SUNMatrixContent_Dense>A.content
+        cdef realtype* d = c.data
+        cdef sunindextype ld = c.M
+        cdef int b, i, j, nb, k0, ii, jj
+        cdef sunindextype ier
+        cdef double tol, aii, dev, worst = 0.0
+        cdef int wi = -1, wj = -1
+        self.nsetups += 1
+        if self.check:
+            # rows outside the blocks are identity rows; a block's row is zero in the columns of
+            # the other blocks (its columns in the outside set S may be anything: A_BS)
+            for i in range(self.n):
+                b = self.block_of[i]
+                aii = d[i * ld + i]
+                tol = self.check_tol * (aii if aii > 1.0 else (-aii if aii < -1.0 else 1.0))
+                if b < 0:
+                    dev = aii - 1.0 if aii > 1.0 else 1.0 - aii
+                    if dev > tol and dev > worst:
+                        worst = dev; wi = i; wj = i
+                for j in range(self.n):
+                    if j == i or not (b < 0 or (self.block_of[j] >= 0 and self.block_of[j] != b)):
+                        continue
+                    dev = d[j * ld + i]
+                    if dev < 0: dev = -dev
+                    if dev > tol and dev > worst:
+                        worst = dev; wi = i; wj = j
+            if wi >= 0:
+                if self.block_of[wi] < 0:
+                    self.message = ("the Newton matrix I - gamma*J has the entry (%d, %d) = %g in the row of "
+                                    "state %d, which is outside every block and must therefore have a zero "
+                                    "implicit rhs" % (wi, wj, d[wj * ld + wi], wi))
+                else:
+                    self.message = ("the Newton matrix I - gamma*J has the entry (%d, %d) = %g coupling block %d "
+                                    "(state %d) to block %d (state %d), which 'implicit_blocks' declares "
+                                    "independent" % (wi, wj, d[wj * ld + wi], self.block_of[wi], wi,
+                                                     self.block_of[wj], wj))
+                self.last_flag = -1
+                return -1
+        for b in range(self.nblocks):
+            k0 = self.bstart[b]
+            nb = self.bstart[b + 1] - k0
+            for jj in range(nb):
+                j = self.bidx[k0 + jj]
+                for ii in range(nb):
+                    self.lu[b][jj][ii] = d[j * ld + self.bidx[k0 + ii]]
+            ier = SUNDlsMat_denseGETRF(self.lu[b], nb, nb, self.piv[b])
+            if ier > 0:
+                self.last_flag = ier
+                return 1
+        self.last_flag = 0
+        return 0
+
+    cdef int solve(self, SUNMatrix A, N_Vector x, N_Vector b) noexcept:
+        cdef SUNDIALS.SUNMatrixContent_Dense c = <SUNDIALS.SUNMatrixContent_Dense>A.content
+        cdef realtype* d = c.data
+        cdef sunindextype ld = c.M
+        cdef realtype* xd = (<N_VectorContent_Serial>x.content).data
+        cdef realtype* bd = (<N_VectorContent_Serial>b.content).data
+        cdef int blk, i, k, s, nb, k0
+        cdef double acc
+        self.nsolves += 1
+        for k in range(self.nout):
+            i = self.sidx[k]
+            xd[i] = bd[i]
+        for blk in range(self.nblocks):
+            k0 = self.bstart[blk]
+            nb = self.bstart[blk + 1] - k0
+            for k in range(nb):
+                i = self.bidx[k0 + k]
+                acc = bd[i]
+                for s in range(self.nout):
+                    acc -= d[self.sidx[s] * ld + i] * xd[self.sidx[s]]
+                self.work[k] = acc
+            SUNDlsMat_denseGETRS(self.lu[blk], nb, self.piv[blk], self.work)
+            for k in range(nb):
+                xd[self.bidx[k0 + k]] = self.work[k]
+        self.last_flag = 0
+        return 0
+
+
+cdef SUNDIALS.SUNLinearSolver_Type block_ls_gettype(SUNLinearSolver S) noexcept:
+    return SUNDIALS.SUNLINEARSOLVER_DIRECT
+
+cdef int block_ls_setup(SUNLinearSolver S, SUNMatrix A) noexcept:
+    return (<BlockLU>S.content).setup(A)
+
+cdef int block_ls_solve(SUNLinearSolver S, SUNMatrix A, N_Vector x, N_Vector b, realtype tol) noexcept:
+    return (<BlockLU>S.content).solve(A, x, b)
+
+cdef sunindextype block_ls_lastflag(SUNLinearSolver S) noexcept:
+    return (<BlockLU>S.content).last_flag
+
+cdef int block_ls_free(SUNLinearSolver S) noexcept:
+    # the content is a Python object owned by the ARKODE instance
+    S.content = NULL
+    SUNLinSolFreeEmpty(S)
+    return 0
+
+cdef SUNLinearSolver block_linear_solver(BlockLU content, SUNDIALS.SUNContext ctx) noexcept:
+    cdef SUNLinearSolver S = SUNLinSolNewEmpty(ctx)
+    if S == NULL:
+        return NULL
+    S.ops.gettype = block_ls_gettype
+    S.ops.setup = block_ls_setup
+    S.ops.solve = block_ls_solve
+    S.ops.lastflag = block_ls_lastflag
+    S.ops.free = block_ls_free
+    S.content = <void*>content
+    return S
 
 
 cdef int sprk_f1(realtype t, N_Vector yv, N_Vector yvdot, void* problem_data) noexcept:
@@ -88,7 +353,19 @@ cdef class ARKODE(Explicit_ODE):
     table (orders 2-5, L-stable ones at every order), Newton iteration and a direct
     dense linear solver with the problem's Jacobian if ``usejac``;
     ``method = "explicit"`` runs an explicit RK table (orders 2-9) without any
-    linear algebra; ``method = "symplectic"`` runs SPRKStep, a symplectic
+    linear algebra; ``method = "imex"`` runs ARKStep's additive Runge-Kutta pairs
+    (orders 2-5) on a split rhs ``f = rhs_implicit + rhs_explicit`` that the
+    problem provides as two methods with the signature of ``rhs``, each returning
+    a full-length vector (zeros outside its part): Newton iteration on the implicit
+    part only, and ``problem.jac`` (if ``usejac``) is then the Jacobian of
+    ``rhs_implicit``. When the implicit part falls into blocks of states whose
+    derivatives do not depend on each other's states (fast subsystems that only
+    talk to each other through the explicit part), ``problem.implicit_blocks`` (a
+    list of index arrays) with ``linear_solver = "BLOCK"`` factors the Newton
+    matrix block by block instead of as one dense matrix; every setup checks the
+    matrix against the declared structure (``block_check``) and stops the run
+    with a message naming the offending entry if it does not hold.
+    ``method = "symplectic"`` runs SPRKStep, a symplectic
     partitioned RK method (orders 1-6, 8, 10) for separable Hamiltonian systems
     at a fixed step ``fixed_h``: the states listed in ``q_states`` are the
     positions (their derivatives are the momenta), the rest the momenta; the
@@ -118,6 +395,8 @@ cdef class ARKODE(Explicit_ODE):
     cdef public object event_func
     cdef public np.ndarray g_old
     cdef object _created_method     # the 'method' the memory block was created for
+    cdef object pt_rhs_i, pt_rhs_e  # problem.rhs_implicit / rhs_explicit (imex), None if absent
+    cdef BlockLU _block_lu           # the BLOCK linear solver's content while it is attached
     cdef dict _last_counters        # ARKODE's cumulative counters at the last store_statistics
     cdef int _fresh_memory          # the memory block was just created: the method-defining options are still to be set
     cdef object _active_table       # the table in use: options['table'] or, after a fallback, options['fallback_table']
@@ -156,11 +435,13 @@ cdef class ARKODE(Explicit_ODE):
         self.options["inith"] = 0.0           # 0: ARKODE estimates the first step
         self.options["maxsteps"] = 10000
         self.options["usejac"] = True if (self.problem_info["jac_fcn"] or self.problem_info["jacv_fcn"]) else False
-        self.options["linear_solver"] = "DENSE"   # or SPGMR (Jacobian-vector products)
+        self.options["linear_solver"] = "DENSE"   # or SPGMR (Jacobian-vector products), or BLOCK (problem.implicit_blocks)
+        self.options["block_check"] = True        # BLOCK: verify the declared structure at every setup
+        self.options["block_check_tol"] = 1.0e-10 # BLOCK: an entry above this (relative to max(1, |A_ii|)) is a violation
         self.options["maxkrylov"] = 5
         self.options["external_event_detection"] = False   # ARKODE rootfinding by default
         # ARKODE-specific
-        self.options["method"] = "implicit"   # "implicit" (DIRK), "explicit" (ERK) or "symplectic" (SPRK)
+        self.options["method"] = "implicit"   # "implicit" (DIRK), "explicit" (ERK), "imex" (ARK pair) or "symplectic" (SPRK)
         self.options["q_states"] = None       # symplectic: indices (or a boolean mask) of the position states
         self.options["fixed_h"] = 0.0         # symplectic: the fixed step size (SPRKStep has no adaptivity)
         self.options["compensated_sums"] = False   # symplectic: Kahan-compensated stage sums
@@ -200,6 +481,7 @@ cdef class ARKODE(Explicit_ODE):
 
         self.statistics.add_key("nstepattempts", "Number of step attempts")
         self.statistics.add_key("nconvfails", "Number of steps failed by nonlinear convergence")
+        self.statistics.add_key("nfcns_implicit", "Number of implicit rhs evaluations (imex: part of nfcns)")
 
         self.supports["report_continuously"] = True
         self.supports["interpolated_output"] = True
@@ -223,6 +505,12 @@ cdef class ARKODE(Explicit_ODE):
     cdef set_problem_data(self):
         self.pt_fcn = self.problem.rhs
         self.pData.RHS = <void*>self.pt_fcn
+        self.pt_rhs_i = getattr(self.problem, "rhs_implicit", None)
+        self.pt_rhs_e = getattr(self.problem, "rhs_explicit", None)
+        if self.pt_rhs_i is not None:
+            self.pData.RHS_I = <void*>self.pt_rhs_i
+        if self.pt_rhs_e is not None:
+            self.pData.RHS_E = <void*>self.pt_rhs_e
         self.pData.dim = self.problem_info["dim"]
         self.pData.memSize = self.pData.dim * sizeof(realtype)
         if self.problem_info["state_events"] is True:
@@ -264,6 +552,7 @@ cdef class ARKODE(Explicit_ODE):
         if self.sun_linearsolver != NULL:
             SUNDIALS.SUNLinSolFree(self.sun_linearsolver)
             self.sun_linearsolver = NULL
+        self._block_lu = None
         if self.sun_matrix != NULL:
             SUNDIALS.SUNMatDestroy(self.sun_matrix)
             self.sun_matrix = NULL
@@ -272,10 +561,23 @@ cdef class ARKODE(Explicit_ODE):
         """Creates the ARKODE memory on the first call, resets it to (t, y) afterwards."""
         cdef int flag
         method = self.options["method"]
-        if method not in ("implicit", "explicit", "symplectic"):
-            raise ARKODEError(ARK_ILL_INPUT, self.t, "'method' must be 'implicit', 'explicit' or 'symplectic'")
+        if method not in ("implicit", "explicit", "imex", "symplectic"):
+            raise ARKODEError(ARK_ILL_INPUT, self.t, "'method' must be 'implicit', 'explicit', 'imex' or 'symplectic'")
         if method == "symplectic":
             self.pData.sprk_qmask = self._q_mask()
+        if method == "imex":
+            for name in ("rhs_implicit", "rhs_explicit"):
+                if getattr(self.problem, name, None) is None:
+                    raise AssimuloException("ARKODE imex: the problem must define '%s(t, y)' (a full-length vector, "
+                                            "zero outside its part; rhs_implicit + rhs_explicit = rhs)." % name)
+        if method in ("implicit", "imex") and self.options["linear_solver"] == "BLOCK":
+            blocks = getattr(self.problem, "implicit_blocks", None)
+            if blocks is None:
+                raise AssimuloException("ARKODE BLOCK: the problem must define 'implicit_blocks' (a list of index "
+                                        "arrays of states whose implicit derivatives do not depend on each "
+                                        "other's states).")
+            if self._block_lu is not None and not _same_blocks(self._block_lu.blocks, blocks):
+                self._free_memory()          # the structure changed: a new linear solver on a new memory block
 
         if self.yTemp != NULL:
             N_VDestroy(self.yTemp)
@@ -293,6 +595,8 @@ cdef class ARKODE(Explicit_ODE):
                 self.ark_mem = ARK.ARKStepCreate(NULL, cv_rhs, self.t, self.yTemp, self.ctx)
             elif method == "explicit":
                 self.ark_mem = ARK.ARKStepCreate(cv_rhs, NULL, self.t, self.yTemp, self.ctx)
+            elif method == "imex":
+                self.ark_mem = ARK.ARKStepCreate(ark_rhs_explicit, ark_rhs_implicit, self.t, self.yTemp, self.ctx)
             else:
                 self.ark_mem = ARK.SPRKStepCreate(sprk_f1, sprk_f2, self.t, self.yTemp, self.ctx)
             if self.ark_mem == NULL:
@@ -321,6 +625,12 @@ cdef class ARKODE(Explicit_ODE):
             flag = ARK.ARKodeSetUserData(self.ark_mem, <void*>self.pData)
             if flag < 0:
                 raise ARKODEError(flag, self.t)
+
+    def _block_message(self):
+        """The BLOCK solver's structure complaint, if its last setup refused the matrix."""
+        if self._block_lu is not None and self._block_lu.message is not None:
+            return "BLOCK: " + self._block_lu.message + "."
+        return None
 
     def _q_mask(self):
         """The position-state mask (1.0 / 0.0 per state) from the 'q_states' option."""
@@ -415,12 +725,21 @@ cdef class ARKODE(Explicit_ODE):
         cdef int flag
         method = self.options["method"]
 
-        # linear solver and Jacobian (implicit only)
-        if method == "implicit":
-            if self.options["linear_solver"] == "DENSE":
+        # linear solver and Jacobian (implicit and imex only)
+        if method in ("implicit", "imex"):
+            if self.options["linear_solver"] in ("DENSE", "BLOCK"):
                 if self.sun_matrix == NULL:
                     self.sun_matrix = SUNDIALS.SUNDenseMatrix(self.pData.dim, self.pData.dim, self.ctx)
-                    self.sun_linearsolver = SUNDIALS.SUNLinSol_Dense(self.yTemp, self.sun_matrix, self.ctx)
+                    if self.options["linear_solver"] == "DENSE":
+                        self.sun_linearsolver = SUNDIALS.SUNLinSol_Dense(self.yTemp, self.sun_matrix, self.ctx)
+                    else:
+                        self._block_lu = BlockLU(self.problem.implicit_blocks, self.pData.dim,
+                                                 1 if method == "implicit" else 0,
+                                                 1 if self.options["block_check"] else 0,
+                                                 float(self.options["block_check_tol"]))
+                        self.sun_linearsolver = block_linear_solver(self._block_lu, self.ctx)
+                    if self.sun_linearsolver == NULL:
+                        raise ARKODEError(ARK_MEM_FAIL, self.t)
                     flag = ARK.ARKodeSetLinearSolver(self.ark_mem, self.sun_linearsolver, self.sun_matrix)
                     if flag < 0:
                         raise ARKODEError(flag, self.t)
@@ -443,7 +762,7 @@ cdef class ARKODE(Explicit_ODE):
                 if flag < 0:
                     raise ARKODEError(flag, self.t)
             else:
-                raise AssimuloException("ARKODE: 'linear_solver' must be DENSE or SPGMR.")
+                raise AssimuloException("ARKODE: 'linear_solver' must be DENSE, BLOCK or SPGMR.")
 
             flag = ARK.ARKodeSetMaxNonlinIters(self.ark_mem, int(self.options["max_nonlin_iters"]))
             if flag < 0: raise ARKODEError(flag, self.t)
@@ -468,15 +787,25 @@ cdef class ARKODE(Explicit_ODE):
         if self._fresh_memory:
             table = self._active_table
             if table is not None:
-                tname = str(table).encode("ascii")
-                if method == "implicit":
-                    flag = ARK.ARKStepSetTableName(self.ark_mem, tname, b"ARKODE_ERK_NONE")
-                elif method == "explicit":
-                    flag = ARK.ARKStepSetTableName(self.ark_mem, b"ARKODE_DIRK_NONE", tname)
+                if method == "imex":
+                    # an ARK pair: (implicit, explicit) names, or the implicit name with the explicit
+                    # partner by ARKODE's naming (ARKODE_ARK436L2SA_DIRK_6_3_4 / ..._ERK_6_3_4)
+                    if isinstance(table, (tuple, list)):
+                        itable, etable = str(table[0]), str(table[1])
+                    else:
+                        itable = str(table)
+                        etable = itable.replace("_DIRK_", "_ERK_")
+                    flag = ARK.ARKStepSetTableName(self.ark_mem, itable.encode("ascii"), etable.encode("ascii"))
                 else:
-                    flag = ARK.SPRKStepSetMethodName(self.ark_mem, tname)
+                    tname = str(table).encode("ascii")
+                    if method == "implicit":
+                        flag = ARK.ARKStepSetTableName(self.ark_mem, tname, b"ARKODE_ERK_NONE")
+                    elif method == "explicit":
+                        flag = ARK.ARKStepSetTableName(self.ark_mem, b"ARKODE_DIRK_NONE", tname)
+                    else:
+                        flag = ARK.SPRKStepSetMethodName(self.ark_mem, tname)
                 if flag < 0:
-                    raise ARKODEError(flag, self.t, "unknown Butcher table '%s'" % table)
+                    raise ARKODEError(flag, self.t, "unknown Butcher table '%s'" % (table,))
             else:
                 flag = ARK.ARKodeSetOrder(self.ark_mem, int(self.options["order"]))
                 if flag < 0:
@@ -507,7 +836,7 @@ cdef class ARKODE(Explicit_ODE):
         if flag < 0: raise ARKODEError(flag, self.t)
         flag = ARK.ARKodeSetMaxEFailGrowth(self.ark_mem, float(self.options["max_efail_growth"]))
         if flag < 0: raise ARKODEError(flag, self.t)
-        if method == "implicit":
+        if method in ("implicit", "imex"):
             flag = ARK.ARKodeSetMaxCFailGrowth(self.ark_mem, float(self.options["max_cfail_growth"]))
             if flag < 0: raise ARKODEError(flag, self.t)
         # step limits
@@ -577,7 +906,7 @@ cdef class ARKODE(Explicit_ODE):
                         continue
                     self.store_statistics(ARK_TSTOP_RETURN)
                     N_VDestroy(yout)
-                    raise ARKODEError(flag, tret)
+                    raise ARKODEError(flag, tret, self._block_message())
                 # ARKODE's maxsteps counts per ARKodeEvolve call, i.e. per step here -- as CVode's
                 # mxstep in the same one-step mode, so no limit applies between output points
                 nsteps_call += 1
@@ -621,7 +950,7 @@ cdef class ARKODE(Explicit_ODE):
                 if flag < 0:
                     self.store_statistics(ARK_TSTOP_RETURN)
                     N_VDestroy(yout)
-                    raise ARKODEError(flag, tret)
+                    raise ARKODEError(flag, tret, self._block_message())
                 tr.append(tret)
                 yr.append(nv2arr(yout))
                 if flag == ARK_ROOT_RETURN:
@@ -659,7 +988,7 @@ cdef class ARKODE(Explicit_ODE):
             raise ARKODEError(flag, t)
         flag = ARK.ARKodeEvolve(self.ark_mem, tf, yout, &tret, ARK_ONE_STEP)
         if flag < 0:
-            raise ARKODEError(flag, tret)
+            raise ARKODEError(flag, tret, self._block_message())
         tr = tret
         yr = nv2arr(yout)
         if flag == ARK_ROOT_RETURN:
@@ -740,7 +1069,7 @@ cdef class ARKODE(Explicit_ODE):
         ARK.ARKodeGetNumErrTestFails(self.ark_mem, &netfails)
         ARK.ARKodeGetNumRhsEvals(self.ark_mem, 0, &nfe)
         ARK.ARKodeGetNumRhsEvals(self.ark_mem, 1, &nfi)
-        if self.options["method"] == "implicit":
+        if self.options["method"] in ("implicit", "imex"):
             ARK.ARKodeGetNumNonlinSolvIters(self.ark_mem, &nniters)
             ARK.ARKodeGetNumNonlinSolvConvFails(self.ark_mem, &nncfails)
             ARK.ARKodeGetNumStepSolveFails(self.ark_mem, &nsolvefails)
@@ -757,6 +1086,7 @@ cdef class ARKODE(Explicit_ODE):
         # the counters are cumulative over the life of the memory block (ARKodeReset keeps them):
         # store the difference to the last stored values
         cur = {"nsteps": nsteps, "nstepattempts": nattempts, "nerrfails": netfails, "nfcns": nfe + nfi,
+               "nfcns_implicit": nfi,
                "nniters": nniters, "nnfails": nncfails, "nconvfails": nsolvefails, "nlus": nlinsetups,
                "njacs": njevals, "njacvecs": njvevals, "nfcnjacs": nfevalsLS, "nstatefcns": ngevals}
         last = self._last_counters
@@ -778,8 +1108,10 @@ cdef class ARKODE(Explicit_ODE):
         if self.fallback_time is not None:
             log(" Fallback                : %s from t = %g%s" % (self.options["fallback_table"], self.fallback_time,
                 "" if self.fallback_return_time is None else ", back from t = %g" % self.fallback_return_time))
-        if self.options["method"] == "implicit":
-            log(" Linear solver           : " + self.options["linear_solver"])
+        if self.options["method"] in ("implicit", "imex"):
+            log(" Linear solver           : " + self.options["linear_solver"]
+                + ("" if self._block_lu is None else " (%d blocks of sizes %s, %d states outside)"
+                   % (self._block_lu.nblocks, self._block_lu.sizes(), self._block_lu.nout)))
         log(" Tolerances (absolute)   : " + str(self._compact_tol(self.options["atol"])))
         log(" Tolerances (relative)   : " + str(self.options["rtol"]))
         log("")
@@ -881,14 +1213,29 @@ cdef class ARKODE(Explicit_ODE):
 
     def _set_linear_solver(self, ls):
         ls = str(ls).upper()
-        if ls not in ("DENSE", "SPGMR"):
-            raise AssimuloException("'linear_solver' must be DENSE or SPGMR.")
+        if ls not in ("DENSE", "BLOCK", "SPGMR"):
+            raise AssimuloException("'linear_solver' must be DENSE, BLOCK or SPGMR.")
         if ls != self.options["linear_solver"]:
             self._free_memory()
         self.options["linear_solver"] = ls
     def _get_linear_solver(self):
         return self.options["linear_solver"]
     linear_solver = property(_get_linear_solver, _set_linear_solver)
+
+    def _set_block_check(self, b):
+        self.options["block_check"] = bool(b)
+    def _get_block_check(self):
+        return self.options["block_check"]
+    block_check = property(_get_block_check, _set_block_check)
+
+    def _set_block_check_tol(self, tol):
+        tol = float(tol)
+        if tol <= 0.0:
+            raise AssimuloException("block_check_tol must be positive.")
+        self.options["block_check_tol"] = tol
+    def _get_block_check_tol(self):
+        return self.options["block_check_tol"]
+    block_check_tol = property(_get_block_check_tol, _set_block_check_tol)
 
     def _set_maxkrylov(self, n):
         self.options["maxkrylov"] = int(n)
@@ -907,8 +1254,8 @@ cdef class ARKODE(Explicit_ODE):
 
     def _set_method(self, m):
         m = str(m).lower()
-        if m not in ("implicit", "explicit", "symplectic"):
-            raise AssimuloException("'method' must be 'implicit', 'explicit' or 'symplectic'.")
+        if m not in ("implicit", "explicit", "imex", "symplectic"):
+            raise AssimuloException("'method' must be 'implicit', 'explicit', 'imex' or 'symplectic'.")
         if m != self.options["method"]:
             self._free_memory()
         self.options["method"] = m
@@ -925,7 +1272,10 @@ cdef class ARKODE(Explicit_ODE):
     order = property(_get_order, _set_order)
 
     def _set_table(self, name):
-        name = None if name is None else str(name)
+        if isinstance(name, (tuple, list)):
+            name = tuple(str(x) for x in name)      # imex: (implicit, explicit) pair
+        else:
+            name = None if name is None else str(name)
         if name != self.options["table"]:
             self._free_memory()
         self.options["table"] = name
@@ -1033,6 +1383,22 @@ cdef class ARKODE(Explicit_ODE):
     def _get_restart_h(self):
         return self.options["restart_h"]
     restart_h = property(_get_restart_h, _set_restart_h)
+
+
+def _same_blocks(a, b):
+    """Whether two block lists name the same index sets in the same order."""
+    try:
+        if len(a) != len(b):
+            return False
+        for x, y in zip(a, b):
+            y = np.asarray(y)
+            if y.dtype == bool:
+                y = np.flatnonzero(y)
+            if not np.array_equal(np.asarray(x), np.unique(y.astype(np.int64))):
+                return False
+        return True
+    except Exception:
+        return False
 
 
 class ARKODEError(Exception):

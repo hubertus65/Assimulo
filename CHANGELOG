@@ -19,6 +19,16 @@
       The dense-output interpolant defaults to degree 3 (`interpolant_degree`): ARKODE's own
       default, the method order, costs extra rhs evaluations at every output point at order 5
       and reports spurious events through the quintic Hermite interpolant under rootfinding.
+      `method = "imex"` runs ARKStep's additive (implicit-explicit) Runge-Kutta pairs, orders
+      2-5, on a rhs the problem splits as `rhs_implicit(t, y) + rhs_explicit(t, y)` (both
+      full-length, zero outside their part); Newton iterates on the implicit part only and
+      `jac` is then its Jacobian. `linear_solver = "BLOCK"` factors the Newton matrix block by
+      block when the problem declares `implicit_blocks`, index sets of implicit states whose
+      derivatives do not depend on each other's states (several fast subsystems that only
+      interact through the explicit part): states outside the blocks are identity rows, each
+      block is a small dense LU with the coupling to the outside states substituted, and every
+      setup checks the matrix against the declared structure, stopping the run with the
+      offending entry when it does not hold. `nfcns_implicit` counts the implicit rhs calls.
     * New solver `TRBDF2` (assimulo.solvers.TRBDF2): TR-BDF2, a second-order L-stable ESDIRK
       method (Hosea & Shampine 1996) implemented in C with a third-order error estimate filtered
       for stiffness, piecewise cubic Hermite dense output, a CVode-like Jacobian reuse policy,

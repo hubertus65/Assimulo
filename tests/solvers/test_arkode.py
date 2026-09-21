@@ -249,7 +249,7 @@ class Test_ARKODE:
         with pytest.raises(AssimuloException):
             sim.atol = [-1.0, 1.0]
         with pytest.raises(AssimuloException):
-            sim.method = "imex"
+            sim.method = "multirate"      # not yet
         with pytest.raises(AssimuloException):
             sim.linear_solver = "SPARSE"
         sim.maxh = None
@@ -418,3 +418,223 @@ class Test_ARKODE_symplectic:
         t, y = s.simulate(3 * np.pi, 300)
         assert s.statistics["nstateevents"] == 3
         assert abs(y[-1, 0] - np.cos(3 * np.pi)) < 1e-3
+
+
+# --------------------------------------------------------------------------- imex and BLOCK
+
+def cart_with_suspensions(k=4, road_jump=False):
+    """A slow body (M = 1500, omega ~ 1 rad/s) carrying k stiff spring-damper units
+    (eigenvalues -53 and -947) that are coupled to each other only through the body: the
+    vehicle pattern. States [x, v, z_1, w_1, ..., z_k, w_k]; the units are the implicit
+    part, the body the explicit part, and each unit is one block."""
+    M, k0, c0 = 1500.0, 2.0e3, 200.0
+    m, ks, cs = 20.0, 1.0e6, 2.0e4
+    n = 2 + 2 * k
+
+    def road(t, i):
+        return 0.05 * np.sin(3.0 * t + i) + (0.02 * (t > 1.0 + 0.3 * i) if road_jump else 0.0)
+
+    def rhs(t, y):
+        x, v = y[0], y[1]
+        dy = np.zeros(n)
+        F = -k0 * x - c0 * v
+        for i in range(k):
+            z, w = y[2 + 2 * i], y[3 + 2 * i]
+            f = -ks * (z - x - road(t, i)) - cs * (w - v)
+            dy[2 + 2 * i] = w
+            dy[3 + 2 * i] = f / m
+            F -= f
+        dy[0] = v
+        dy[1] = F / M
+        return dy
+
+    def rhs_implicit(t, y):
+        dy = rhs(t, y); dy[:2] = 0.0; return dy
+
+    def rhs_explicit(t, y):
+        dy = rhs(t, y); dy[2:] = 0.0; return dy
+
+    def jac_implicit(t, y):
+        J = np.zeros((n, n))
+        for i in range(k):
+            r = 3 + 2 * i
+            J[r - 1, r] = 1.0
+            J[r, r - 1] = -ks / m; J[r, r] = -cs / m
+            J[r, 0] = ks / m;      J[r, 1] = cs / m
+        return J
+
+    mod = Explicit_Problem(rhs, np.zeros(n))
+    mod.rhs_implicit = rhs_implicit
+    mod.rhs_explicit = rhs_explicit
+    mod.jac = jac_implicit
+    mod.implicit_blocks = [[2 + 2 * i, 3 + 2 * i] for i in range(k)]
+    return mod
+
+
+def _run(mod, tf=3.0, ncp=300, **opts):
+    s = ARKODE(mod)
+    for key, val in opts.items():
+        setattr(s, key, val)
+    s.verbosity = 50
+    t, y = s.simulate(tf, ncp)
+    return y, s
+
+
+def _reldev(y, yref):
+    return np.max(np.abs(y - yref) / (np.max(np.abs(yref), axis=0) + 1e-12))
+
+
+_references = {}
+
+def _reference(mod, key, tf=3.0, ncp=300):
+    """Radau5 at rtol 1e-10, cached per problem key."""
+    if key not in _references:
+        s = Radau5ODE(mod); s.rtol = 1e-10; s.atol = 1e-12; s.verbosity = 50
+        _references[key] = s.simulate(tf, ncp)[1]
+    return _references[key]
+
+
+class Test_ARKODE_imex:
+
+    @pytest.mark.parametrize("k", [1, 4])
+    def test_imex_matches_implicit_and_reference(self, k):
+        mod = cart_with_suspensions(k)
+        yref = _reference(mod, ("cart", k))
+        y_impl, s_impl = _run(mod, rtol=1e-6, atol=1e-8, method="implicit")
+        y_imex, s_imex = _run(mod, rtol=1e-6, atol=1e-8, method="imex")
+        y_tight, _ = _run(mod, rtol=1e-8, atol=1e-10, method="imex")
+        assert _reldev(y_impl, yref) < 1e-3
+        # the ARK436 pair's embedded estimate is optimistic on this problem at rtol 1e-6
+        # (k = 1: 7e-3 at a quarter of the DIRK's steps); it converges with the tolerance
+        assert _reldev(y_imex, yref) < 1e-2
+        assert _reldev(y_tight, yref) < 1e-5
+        assert s_imex.statistics["nfcns_implicit"] > 0
+        assert s_imex.statistics["nfcns"] > s_imex.statistics["nfcns_implicit"]   # the explicit part was evaluated too
+        assert s_impl.statistics["nfcns_implicit"] == s_impl.statistics["nfcns"]
+        assert s_imex.statistics["nfcnjacs"] == 0                                 # the user Jacobian (of fi) was used
+
+    def test_block_equals_dense(self):
+        """The block LU gives the dense LU's solution: same counts within a few steps, same
+        result within the tolerance; the statistics show the blocks."""
+        mod = cart_with_suspensions(4)
+        reference = _reference(mod, ("cart", 4))
+        y_d, s_d = _run(mod, rtol=1e-6, atol=1e-8, method="imex", linear_solver="DENSE")
+        y_b, s_b = _run(mod, rtol=1e-6, atol=1e-8, method="imex", linear_solver="BLOCK")
+        assert _reldev(y_b, y_d) < 1e-5
+        assert _reldev(y_b, reference) < 1e-3
+        assert abs(s_b.statistics["nsteps"] - s_d.statistics["nsteps"]) <= 0.02 * s_d.statistics["nsteps"]
+        assert abs(s_b.statistics["nlus"] - s_d.statistics["nlus"]) <= 0.05 * s_d.statistics["nlus"] + 2
+        s_b.print_statistics()                     # the block line of the printout
+
+    def test_block_without_jacobian(self):
+        """BLOCK with ARKODE's difference-quotient Jacobian of fi."""
+        mod = cart_with_suspensions(2)
+        yref = _reference(mod, ("cart", 2))
+        y, s = _run(mod, rtol=1e-6, atol=1e-8, method="imex", linear_solver="BLOCK", usejac=False)
+        assert _reldev(y, yref) < 1e-3
+        assert s.statistics["nfcnjacs"] > 0
+
+    def test_block_check_refuses_wrong_blocks(self):
+        """A block split through a coupled pair is caught at the first setup, with the entry named."""
+        mod = cart_with_suspensions(2)
+        mod.implicit_blocks = [[2], [3], [4, 5]]
+        with pytest.raises(ARKODEError, match=r"coupling block 1 \(state 3\) to block 0 \(state 2\)"):
+            _run(mod, method="imex", linear_solver="BLOCK")
+        # a state outside the blocks whose implicit rhs is not zero
+        mod.implicit_blocks = [[2, 3]]
+        with pytest.raises(ARKODEError, match=r"outside every block"):
+            _run(mod, method="imex", linear_solver="BLOCK")
+        # the check switched off: the run proceeds with the (wrong) block solver
+        mod.implicit_blocks = [[2], [3], [4, 5]]
+        y, s = _run(mod, method="imex", linear_solver="BLOCK", block_check=False)
+        assert s.statistics["nsteps"] > 0
+
+    def test_block_validation(self):
+        mod = cart_with_suspensions(2)
+        for blocks, msg in (([[2, 3], [3, 4]], "overlaps"), ([[2, 9]], "outside 0..5"), ([[]], "empty"),
+                            ([], "is empty"), ([np.array([True, False])], "one entry per state")):
+            mod.implicit_blocks = blocks
+            with pytest.raises(AssimuloException, match=msg):
+                _run(mod, method="imex", linear_solver="BLOCK")
+        # fully implicit: the blocks must cover every state
+        mod.implicit_blocks = [[2, 3], [4, 5]]
+        with pytest.raises(AssimuloException, match="cover every state"):
+            _run(mod, method="implicit", linear_solver="BLOCK")
+        del mod.implicit_blocks
+        with pytest.raises(AssimuloException, match="implicit_blocks"):
+            _run(mod, method="imex", linear_solver="BLOCK")
+        # boolean masks are accepted
+        mod.implicit_blocks = [np.arange(6) // 2 == 1, np.arange(6) // 2 == 2]
+        y, s = _run(mod, method="imex", linear_solver="BLOCK")
+        assert s.statistics["nsteps"] > 0
+
+    def test_block_fully_implicit_decoupled(self):
+        """Two independent Van der Pol oscillators, fully implicit, one block each."""
+        mu = 1e3
+        def f(t, y):
+            return np.array([y[1], mu * ((1. - y[0]**2) * y[1] - y[0]),
+                             y[3], 2 * mu * ((1. - y[2]**2) * y[3] - y[2])])
+        mod = Explicit_Problem(f, [2.0, -0.6, 1.5, -0.4])
+        mod.implicit_blocks = [[0, 1], [2, 3]]
+        y_d, s_d = _run(mod, tf=2.0, ncp=100, rtol=1e-6, atol=1e-8, method="implicit", linear_solver="DENSE")
+        y_b, s_b = _run(mod, tf=2.0, ncp=100, rtol=1e-6, atol=1e-8, method="implicit", linear_solver="BLOCK")
+        assert _reldev(y_b, y_d) < 1e-5
+        yref = _reference(mod, "vdp2", tf=2.0, ncp=100)
+        assert _reldev(y_b, yref) < 5e-3
+
+    def test_imex_requires_the_split(self):
+        mod = vanderpol()
+        with pytest.raises(AssimuloException, match="rhs_implicit"):
+            _run(mod, method="imex")
+        mod.rhs_implicit = mod.rhs
+        with pytest.raises(AssimuloException, match="rhs_explicit"):
+            _run(mod, method="imex")
+
+    def test_imex_tables(self):
+        """ARK pairs by order and by name (a pair, or the implicit name with the partner derived)."""
+        mod = cart_with_suspensions(1)
+        yref = _reference(mod, ("cart", 1))
+        for order, table in ((2, None), (3, None), (5, None),
+                             (None, "ARKODE_ARK324L2SA_DIRK_4_2_3"),
+                             (None, ("ARKODE_ARK548L2SA_DIRK_8_4_5", "ARKODE_ARK548L2SA_ERK_8_4_5"))):
+            opts = dict(method="imex", rtol=1e-6, atol=1e-8)
+            if order: opts["order"] = order
+            if table: opts["table"] = table
+            y, s = _run(mod, **opts)
+            assert _reldev(y, yref) < 1e-2, (order, table)
+        with pytest.raises(ARKODEError, match="unknown Butcher table"):
+            _run(mod, method="imex", table="ARKODE_NO_SUCH_DIRK_1_1_1")
+
+    def test_imex_state_events(self):
+        """Events under imex: the road step is turned into a switch that flips at a crossing
+        of the body's velocity; the event count agrees with the fully implicit run."""
+        mod = cart_with_suspensions(2, road_jump=True)
+        f, fi, fe, J = mod.rhs, mod.rhs_implicit, mod.rhs_explicit, mod.jac
+        mod.rhs = lambda t, y, sw: f(t, y)
+        mod.rhs_implicit = lambda t, y, sw: fi(t, y)
+        mod.rhs_explicit = lambda t, y, sw: fe(t, y)
+        mod.jac = lambda t, y, sw: J(t, y)
+        mod.state_events = lambda t, y, sw: np.array([y[1]])
+        def handle(solver, info):
+            solver.sw[0] = not solver.sw[0]
+        mod.handle_event = handle
+        mod.sw0 = [True]
+        y_i, s_i = _run(mod, rtol=1e-6, atol=1e-8, method="implicit")
+        y_x, s_x = _run(mod, rtol=1e-6, atol=1e-8, method="imex", linear_solver="BLOCK")
+        assert s_i.statistics["nstateevents"] > 2
+        assert s_x.statistics["nstateevents"] == s_i.statistics["nstateevents"]
+        assert _reldev(y_x, y_i) < 1e-2
+
+    def test_switching_method_and_blocks_between_runs(self):
+        mod = cart_with_suspensions(2)
+        s = ARKODE(mod); s.rtol = 1e-6; s.atol = 1e-8; s.verbosity = 50
+        s.method = "imex"; s.linear_solver = "BLOCK"
+        t, y1 = s.simulate(1.0, 50)
+        mod.implicit_blocks = [[2, 3, 4, 5]]           # one block: also valid, picked up on the next run
+        s.reset()
+        t, y2 = s.simulate(1.0, 50)
+        assert _reldev(y2, y1) < 1e-5
+        s.method = "implicit"; s.linear_solver = "DENSE"
+        s.reset()
+        t, y3 = s.simulate(1.0, 50)
+        assert _reldev(y3, y1) < 1e-3
