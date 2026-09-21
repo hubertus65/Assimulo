@@ -25,6 +25,7 @@ cdef extern from "trbdf2.h":
 
     ctypedef struct trbdf2_stats:
         long nsteps, naccpt, nreject, nfcn, nfcnjac, njac, nlu, nsolve, nnewton, nnfail, nrhsfail
+        long njacfail, njacstale
         long nnfail_div, nnfail_iter
     ctypedef struct trbdf2_mem:
         pass

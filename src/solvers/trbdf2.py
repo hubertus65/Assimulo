@@ -72,6 +72,8 @@ class TRBDF2(Explicit_ODE):
 
         # Statistics ("nlus" is a default key of the base class)
         self.statistics.add_key("nrhsfails", "Number of recoverable rhs failures")
+        self.statistics.add_key("njacfails", "Number of refused user Jacobians (differences used)")
+        self.statistics.add_key("njacstale", "Number of refused Jacobians (previous one kept)")
         self.statistics.add_key("nnfails_div", "Number of Newton failures by divergence")
         self.statistics.add_key("nnfails_iter", "Number of Newton failures by the iteration limit")
 
@@ -235,6 +237,8 @@ class TRBDF2(Explicit_ODE):
         self.statistics["nniters"] += st["nnewton"]
         self.statistics["nnfails"] += st["nnfail"]
         self.statistics["nrhsfails"] += st["nrhsfail"]
+        self.statistics["njacfails"] += st["njacfail"]
+        self.statistics["njacstale"] += st["njacstale"]
         self.statistics["nnfails_div"] += st["nnfail_div"]
         self.statistics["nnfails_iter"] += st["nnfail_iter"]
         self._memory.reset_stats()    # the counters were added to self.statistics

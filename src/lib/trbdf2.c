@@ -46,7 +46,7 @@ struct trbdf2_mem {
                                             last accepted step (y0 holds its start; y2/f2 may belong to a rejected attempt) */
     double *fbase;                       /* rhs at the base point of a finite-difference Jacobian */
     double *ytmp, *ftmp, *delta, *err, *werr, *scal;
-    double *jac, *lu;                    /* n*n column-major */
+    double *jac, *lu, *jacnew;           /* n*n column-major; jacnew: a Jacobian under construction, so a refused one leaves jac intact */
     int *piv;
     double t0, h;                        /* start of the last accepted step and its size */
     double h_next;                       /* step size proposed for the next step */
@@ -126,9 +126,10 @@ int trbdf2_create(int n, trbdf2_mem **mem_out) {
     m->delta = (double *)malloc(n * sizeof(double)); m->err = (double *)malloc(n * sizeof(double));
     m->werr = (double *)malloc(n * sizeof(double)); m->scal = (double *)malloc(n * sizeof(double));
     m->jac = (double *)malloc((size_t)n * n * sizeof(double)); m->lu = (double *)malloc((size_t)n * n * sizeof(double));
+    m->jacnew = (double *)malloc((size_t)n * n * sizeof(double));
     m->piv = (int *)malloc(n * sizeof(int));
     if (!m->rtol || !m->atol || !m->y0 || !m->f0 || !m->y1 || !m->f1 || !m->y2 || !m->f2 || !m->fd0 || !m->yd1 || !m->fd1 || !m->fbase || !m->ytmp || !m->ftmp ||
-        !m->delta || !m->err || !m->werr || !m->scal || !m->jac || !m->lu || !m->piv) {
+        !m->delta || !m->err || !m->werr || !m->scal || !m->jac || !m->lu || !m->jacnew || !m->piv) {
         trbdf2_free(&m); return TRBDF2_ERROR_MEM;
     }
     { int i; for (i = 0; i < n; i++) { m->rtol[i] = 1e-6; m->atol[i] = 1e-8; } }
@@ -145,7 +146,7 @@ void trbdf2_free(trbdf2_mem **mem) {
     m = *mem;
     free(m->rtol); free(m->atol); free(m->y0); free(m->f0); free(m->y1); free(m->f1); free(m->y2); free(m->f2); free(m->fd0); free(m->yd1); free(m->fd1); free(m->fbase);
     free(m->ytmp); free(m->ftmp); free(m->delta); free(m->err); free(m->werr); free(m->scal);
-    free(m->jac); free(m->lu); free(m->piv);
+    free(m->jac); free(m->lu); free(m->jacnew); free(m->piv);
     free(m); *mem = NULL;
 }
 
@@ -191,29 +192,53 @@ void trbdf2_get_stats(trbdf2_mem *m, trbdf2_stats *s) { if (m && s) *s = m->stat
 const char *trbdf2_get_err_msg(trbdf2_mem *m) { return m ? m->err_msg : "no memory"; }
 
 /* ------------------------------------------------------------------ Jacobian */
-static int form_jacobian(trbdf2_mem *m, trbdf2_rhs_fn rhs, trbdf2_jac_fn jac, void *user, double t, const double *y) {
+/* Forward differences, one column per component, from an rhs call at the base point (f0 is the
+   algebraic stage derivative, not accurate enough for a difference quotient). Writes J. */
+static int difference_jacobian(trbdf2_mem *m, trbdf2_rhs_fn rhs, void *user, double t, const double *y, double *J) {
     int n = m->n, i, j, ret;
     const double *f = m->fbase;
-    if (m->use_user_jac && jac != NULL) {
-        ret = jac(n, t, y, m->jac, user);
-        if (ret != 0) return ret;
-    } else {
-        /* forward differences, one column per component, from an rhs call at the base point
-           (f0 is the algebraic stage derivative, not accurate enough for a difference quotient) */
-        ret = rhs(n, t, y, m->fbase, user);
+    ret = rhs(n, t, y, m->fbase, user);
+    m->stats.nfcnjac++;
+    if (ret != 0) return ret;
+    for (j = 0; j < n; j++) {
+        double dy = sqrt(2.2e-16) * fmax(fabs(y[j]), m->atol[j] / m->rtol[j] > 0.0 ? m->atol[j] / m->rtol[j] : 1e-5);
+        if (dy == 0.0) dy = 1e-8;
+        memcpy(m->ytmp, y, n * sizeof(double));
+        m->ytmp[j] += dy;
+        ret = rhs(n, t, m->ytmp, m->ftmp, user);
         m->stats.nfcnjac++;
         if (ret != 0) return ret;
-        for (j = 0; j < n; j++) {
-            double dy = sqrt(2.2e-16) * fmax(fabs(y[j]), m->atol[j] / m->rtol[j] > 0.0 ? m->atol[j] / m->rtol[j] : 1e-5);
-            if (dy == 0.0) dy = 1e-8;
-            memcpy(m->ytmp, y, n * sizeof(double));
-            m->ytmp[j] += dy;
-            ret = rhs(n, t, m->ytmp, m->ftmp, user);
-            m->stats.nfcnjac++;
-            if (ret != 0) return ret;
-            for (i = 0; i < n; i++) m->jac[i + j * n] = (m->ftmp[i] - f[i]) / dy;
+        for (i = 0; i < n; i++) J[i + j * n] = (m->ftmp[i] - f[i]) / dy;
+    }
+    return 0;
+}
+
+/* The Jacobian at the base point (t, y). A user Jacobian that the model refuses (> 0: a nonlinear
+   block that does not converge at a perturbed state, a bracketing failure) is not retried at a
+   smaller h -- the base point does not move with h -- but replaced by the stepper's own differences
+   through rhs, which perturb differently (CVode's route on the same models); if those are refused
+   too, the previous Jacobian is kept when there is one (Newton then decides; a failure shrinks h
+   because the caller counts the kept Jacobian as fresh), and only with nothing to fall back on
+   does the refusal reach the caller as a recoverable failure. A new Jacobian is built in jacnew so
+   a refusal halfway through leaves the previous one intact. */
+static int form_jacobian(trbdf2_mem *m, trbdf2_rhs_fn rhs, trbdf2_jac_fn jac, void *user, double t, const double *y) {
+    int n = m->n, ret = 0, try_differences = 1;
+    if (m->use_user_jac && jac != NULL) {
+        ret = jac(n, t, y, m->jacnew, user);
+        if (ret < 0) return ret;
+        if (ret > 0) m->stats.njacfail++; else try_differences = 0;
+    }
+    if (try_differences) {
+        ret = difference_jacobian(m, rhs, user, t, y, m->jacnew);
+        if (ret < 0) return ret;
+        if (ret > 0) {
+            if (!m->have_jac) return ret;
+            m->stats.njacstale++;
+            m->steps_since_jac = 0; m->have_lu = 0;
+            return 0;
         }
     }
+    memcpy(m->jac, m->jacnew, (size_t)n * n * sizeof(double));
     m->stats.njac++;
     m->have_jac = 1; m->steps_since_jac = 0; m->have_lu = 0;
     return 0;

@@ -43,6 +43,7 @@ typedef int (*trbdf2_solout_fn)(int naccpt, double told, double t, const double 
 
 typedef struct trbdf2_stats {
     long nsteps, naccpt, nreject, nfcn, nfcnjac, njac, nlu, nsolve, nnewton, nnfail, nrhsfail;
+    long njacfail, njacstale;            /* user Jacobian refused (fell back to differences); both refused, previous Jacobian kept */
     long nnfail_div, nnfail_iter;        /* Newton failures by divergence / by the iteration limit */
 } trbdf2_stats;
 

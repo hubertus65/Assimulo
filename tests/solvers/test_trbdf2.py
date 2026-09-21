@@ -162,6 +162,57 @@ class Test_TRBDF2:
         assert y[-1][0] == pytest.approx(1.0 - np.exp(-3.0), abs=1e-4)
         assert sim.statistics["nrhsfails"] >= 1
 
+    def test_recoverable_jacobian_failure(self):
+        """A user Jacobian the model refuses is replaced by the stepper's own differences
+        (the base point does not move with h, so a retry would refuse again); the run
+        completes with the same accuracy as with a working Jacobian."""
+        mod = vanderpol()
+        good_jac = mod.jac
+        calls = {"jac": 0}
+
+        def jac(t, y):
+            calls["jac"] += 1
+            if 0.5 < t < 1.5:
+                raise AssimuloRecoverableError("nonlinear block did not converge at the perturbed state")
+            return good_jac(t, y)
+        mod.jac = jac
+        sim = TRBDF2(mod)
+        sim.rtol = 1e-6; sim.atol = 1e-8; sim.verbosity = 50
+        t, y = sim.simulate(2.0)
+        ref = TRBDF2(vanderpol()); ref.rtol = 1e-6; ref.atol = 1e-8; ref.verbosity = 50
+        tr, yr = ref.simulate(2.0)
+        assert y[-1][0] == pytest.approx(yr[-1][0], rel=1e-4)
+        assert sim.statistics["njacfails"] >= 1 and sim.statistics["njacstale"] == 0
+        assert sim.statistics["nfcnjacs"] > 0                    # the differences were used
+        assert sim.statistics["njacs"] >= ref.statistics["njacs"] - 2   # no Jacobian was lost to a refusal
+
+    def test_refused_jacobian_keeps_previous(self):
+        """When the differences are refused as well, the previous Jacobian is kept and the
+        integration continues rather than dying on a repeated-failure budget. The
+        differences are told apart from Newton's trial points by their time: they are
+        evaluated at the base point's t, Newton's stages at t + gamma h and t + h."""
+        lam = -1000.0
+        last_jac_t = [None]
+
+        def f(t, y):
+            if 1.0 < t < 1.5 and t == last_jac_t[0]:
+                raise AssimuloRecoverableError("refused at a perturbed state")
+            return np.array([lam * (y[0] - np.cos(t)) - np.sin(t)])
+
+        def jac(t, y):
+            last_jac_t[0] = t
+            if 1.0 < t < 1.5:
+                raise AssimuloRecoverableError("refused")
+            return np.array([[lam]])
+        mod = Explicit_Problem(f, [1.0])
+        mod.jac = jac
+        sim = TRBDF2(mod)
+        sim.rtol = 1e-6; sim.atol = 1e-8; sim.verbosity = 50
+        sim.maxsteps_jac = 5
+        t, y = sim.simulate(3.0)
+        assert y[-1][0] == pytest.approx(np.cos(3.0), abs=1e-5)
+        assert sim.statistics["njacfails"] >= 1 and sim.statistics["njacstale"] >= 1
+
     def test_maxsteps(self):
         sim = TRBDF2(vanderpol())
         sim.verbosity = 50

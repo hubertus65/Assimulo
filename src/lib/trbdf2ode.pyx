@@ -118,7 +118,7 @@ cdef class TRBDF2Memory:
         cdef trbdf2_stats s
         trbdf2_get_stats(self.mem, &s)
         return {"nsteps": s.nsteps, "naccpt": s.naccpt, "nreject": s.nreject, "nfcn": s.nfcn, "nfcnjac": s.nfcnjac,
-                "njac": s.njac, "nlu": s.nlu, "nsolve": s.nsolve, "nnewton": s.nnewton, "nnfail": s.nnfail, "nrhsfail": s.nrhsfail,
+                "njac": s.njac, "nlu": s.nlu, "nsolve": s.nsolve, "nnewton": s.nnewton, "nnfail": s.nnfail, "nrhsfail": s.nrhsfail, "njacfail": s.njacfail, "njacstale": s.njacstale,
                 "nnfail_div": s.nnfail_div, "nnfail_iter": s.nnfail_iter}
 
     cpdef int reset_stats(self):
