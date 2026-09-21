@@ -25,10 +25,19 @@
  * retried up to max_consecutive times, as CVode does.
  */
 #include <math.h>
+#include <float.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "trbdf2.h"
+
+/* The smallest step worth attempting: a few ulps of t, as CVode's "t + h == t" floor (CV_TOO_CLOSE),
+   not the 1e-14 |t| this started with. Measured 2026-09-21 on DataCenter.Examples.Systems.SetPointOptimization:
+   a sampled input step at t = 3110 drives a state (chwFcSplit.flowFractions) on a nanosecond time
+   scale; CVode gets through with 272 steps from h = 4.5e-13 inside the first millisecond, and TRBDF2's
+   error estimate was one halving from acceptance (12.6 at h = 3.1e-11, falling as h^2.2) when the
+   old floor of 3.1e-11 ended the run. */
+static double min_step(double t) { return 8.0 * DBL_EPSILON * fmax(fabs(t), 1.0); }
 
 static int trace_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TRBDF2_TRACE"); v = e ? atoi(e) : 0; } return v; }
 
@@ -361,7 +370,7 @@ int trbdf2_solve(trbdf2_mem *m, trbdf2_rhs_fn rhs, trbdf2_jac_fn jac, trbdf2_sol
         /* land exactly on tend */
         last = 0;
         if (dir * (*t + dir * h - tend) >= -1e-10 * fmax(fabs(tend), 1.0)) { h = fabs(tend - *t); last = 1; }
-        if (h < 1e-14 * fmax(fabs(*t), 1.0)) {
+        if (h < min_step(*t)) {
             if (last) { *t = tend; return TRBDF2_OK; }      /* the remaining segment is roundoff */
             fail(m, "step size too small", *t); return TRBDF2_ERROR_STEP_TOO_SMALL;
         }
@@ -466,7 +475,7 @@ int trbdf2_solve(trbdf2_mem *m, trbdf2_rhs_fn rhs, trbdf2_jac_fn jac, trbdf2_sol
         h *= m->fail_factor;                                                                    /* fresh Jacobian: smaller step */
         m->have_lu = 0;
         m->stats.nreject++;
-        if (h < 1e-14 * fmax(fabs(*t), 1.0)) { fail(m, "Newton iteration does not converge", *t); return TRBDF2_ERROR_NEWTON; }
+        if (h < min_step(*t)) { fail(m, "Newton iteration does not converge", *t); return TRBDF2_ERROR_NEWTON; }
         continue;
 
     recoverable:
