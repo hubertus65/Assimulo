@@ -1,5 +1,9 @@
 --- CHANGELOG ---
 --- Assimulo-FUTURE---
+    * CVode, IDA and KINSOL create one SUNContext per solver object instead of one per
+      (re)initialization, interpolation call and array-to-N_Vector conversion, and free it;
+      every one of those contexts was leaked (SUNDIALS >= 6), and each re-created the
+      SUNLogger from the environment (SUNDIALS >= 7), truncating a log file at every event.
     * New solver `ARKODE` (assimulo.solvers.ARKODE): SUNDIALS ARKODE's ARKStep with a diagonally
       implicit (orders 2-5) or explicit (orders 2-9) Runge-Kutta table selected by `order` or by
       name with `table`, Newton with the problem Jacobian (dense) or Jacobian-vector products
