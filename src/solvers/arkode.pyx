@@ -566,10 +566,16 @@ cdef class ARKODE(Explicit_ODE):
         if method == "symplectic":
             self.pData.sprk_qmask = self._q_mask()
         if method == "imex":
-            for name in ("rhs_implicit", "rhs_explicit"):
-                if getattr(self.problem, name, None) is None:
+            # taken from the problem here, not only in __init__: PyFMI sets the partition on
+            # the problem after creating the solver
+            self.pt_rhs_i = getattr(self.problem, "rhs_implicit", None)
+            self.pt_rhs_e = getattr(self.problem, "rhs_explicit", None)
+            for name, fn in (("rhs_implicit", self.pt_rhs_i), ("rhs_explicit", self.pt_rhs_e)):
+                if fn is None:
                     raise AssimuloException("ARKODE imex: the problem must define '%s(t, y)' (a full-length vector, "
                                             "zero outside its part; rhs_implicit + rhs_explicit = rhs)." % name)
+            self.pData.RHS_I = <void*>self.pt_rhs_i
+            self.pData.RHS_E = <void*>self.pt_rhs_e
         if method in ("implicit", "imex") and self.options["linear_solver"] == "BLOCK":
             blocks = getattr(self.problem, "implicit_blocks", None)
             if blocks is None:
