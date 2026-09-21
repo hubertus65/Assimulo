@@ -401,6 +401,8 @@ cdef class ARKODE(Explicit_ODE):
     cdef int _fresh_memory          # the memory block was just created: the method-defining options are still to be set
     cdef object _active_table       # the table in use: options['table'] or, after a fallback, options['fallback_table']
     cdef long int _fb_attempts0, _fb_fails0, _fb_rhsfails0   # counters at the start of the current failure-rate window
+    cdef int _consecutive_rhsfails   # restarts after a refused stage point since the last accepted step
+    cdef long int _rhsfails_seen     # pData.nrhsfails at the last check: a retry needs a new failure
     cdef public object fallback_time  # time of the fallback to the 2-stage table, None if it did not happen
     cdef public object fallback_return_time   # time of the switch back to the user's table after a hard failure of the fallback
 
@@ -478,10 +480,18 @@ cdef class ARKODE(Explicit_ODE):
         self.options["fallback_table"] = "ARKODE_TRBDF2_3_3_2"
         self.options["fallback_conv_fail_rate"] = 0.25
         self.options["fallback_window"] = 50
+        # A recoverable rhs failure (the FMU refusing a trial point) at a directly evaluated
+        # stage -- every explicit stage of an ERK or ARK pair, the first stage of an ESDIRK --
+        # is ARK_UNREC_RHSFUNC_ERR to ARKODE: it retries only the failures inside Newton. As
+        # Radau5/TRBDF2, the run is then restarted at the last accepted point with the step
+        # reduced by 'fail_factor', up to 'fail_max' consecutive times.
+        self.options["fail_factor"] = 0.25
+        self.options["fail_max"] = 40
 
         self.statistics.add_key("nstepattempts", "Number of step attempts")
         self.statistics.add_key("nconvfails", "Number of steps failed by nonlinear convergence")
         self.statistics.add_key("nfcns_implicit", "Number of implicit rhs evaluations (imex: part of nfcns)")
+        self.statistics.add_key("nrhsfails", "Number of recoverable rhs failures")
 
         self.supports["report_continuously"] = True
         self.supports["interpolated_output"] = True
@@ -539,6 +549,8 @@ cdef class ARKODE(Explicit_ODE):
         self._fb_fails0 = 0
         self._fb_rhsfails0 = 0
         self.pData.nrhsfails = 0
+        self._consecutive_rhsfails = 0
+        self._rhsfails_seen = 0
         self.initialize_arkode()
 
     cdef _free_memory(self):
@@ -726,6 +738,38 @@ cdef class ARKODE(Explicit_ODE):
         self._switch_table(tcur, y, tf, self.options["table"])
         return 1
 
+    cdef int _retry_after_rhs_failure(self, int flag, double t, np.ndarray y, double tf) except -1:
+        """A recoverable rhs failure at a directly evaluated stage (ARK_UNREC_RHSFUNC_ERR with
+        the problem's failure counter advanced): restart at (t, y), the caller's last point --
+        the last accepted step in one-step mode, the last output point otherwise (ARKODE's own
+        current point may lie beyond a pending output time, which a reset there would make
+        unreachable) -- with the step reduced by fail_factor. Returns 1 to go on, else 0."""
+        cdef double tcur = t, hcur = 0.0
+        cdef N_Vector ycur
+        cdef int rflag
+        if flag != ARK_UNREC_RHSFUNC_ERR or self.pData.nrhsfails == self._rhsfails_seen:
+            return 0
+        self._rhsfails_seen = self.pData.nrhsfails
+        if self._consecutive_rhsfails >= int(self.options["fail_max"]):
+            self.log_message("ARKODE: %d consecutive refused stage points at t = %g; giving up"
+                             % (self._consecutive_rhsfails, t), NORMAL)
+            return 0
+        self._consecutive_rhsfails += 1
+        ARK.ARKodeGetCurrentStep(self.ark_mem, &hcur)
+        ycur = arr2nv(y, <void*>self.ctx)
+        rflag = ARK.ARKodeReset(self.ark_mem, tcur, ycur)
+        N_VDestroy(ycur)
+        if rflag < 0: raise ARKODEError(rflag, tcur)
+        if hcur <= 0.0:
+            hcur = float(self.options["inith"])
+        rflag = ARK.ARKodeSetInitStep(self.ark_mem, float(self.options["fail_factor"]) * hcur)
+        if rflag < 0: raise ARKODEError(rflag, tcur)
+        rflag = ARK.ARKodeSetStopTime(self.ark_mem, tf)
+        if rflag < 0: raise ARKODEError(rflag, tcur)
+        self.log_message("ARKODE: the rhs refused a stage point at t = %g (step %g); retrying from t = %g with the step %g"
+                         % (t, hcur, tcur, float(self.options["fail_factor"]) * hcur), LOUD)
+        return 1
+
     cpdef initialize_options(self):
         """Applies the options to the ARKODE memory (called on every (re)initialization)."""
         cdef int flag
@@ -908,11 +952,12 @@ cdef class ARKODE(Explicit_ODE):
             while True:
                 flag = ARK.ARKodeEvolve(self.ark_mem, tf, yout, &tret, ARK_ONE_STEP)
                 if flag < 0:
-                    if self._retry_after_failure(flag, tret, tf):
+                    if self._retry_after_failure(flag, tret, tf) or self._retry_after_rhs_failure(flag, t, y, tf):
                         continue
                     self.store_statistics(ARK_TSTOP_RETURN)
                     N_VDestroy(yout)
                     raise ARKODEError(flag, tret, self._block_message())
+                self._consecutive_rhsfails = 0
                 # ARKODE's maxsteps counts per ARKodeEvolve call, i.e. per step here -- as CVode's
                 # mxstep in the same one-step mode, so no limit applies between output points
                 nsteps_call += 1
@@ -951,7 +996,8 @@ cdef class ARKODE(Explicit_ODE):
             output_list = opts["output_list"][output_index:]
             for tout in output_list:
                 flag = ARK.ARKodeEvolve(self.ark_mem, tout, yout, &tret, ARK_NORMAL)
-                if flag < 0 and self._retry_after_failure(flag, tret, tf):
+                while flag < 0 and (self._retry_after_failure(flag, tret, tf) or
+                                    self._retry_after_rhs_failure(flag, tr[-1] if tr else t, yr[-1] if yr else y, tf)):
                     flag = ARK.ARKodeEvolve(self.ark_mem, tout, yout, &tret, ARK_NORMAL)
                 if flag < 0:
                     self.store_statistics(ARK_TSTOP_RETURN)
@@ -1095,6 +1141,7 @@ cdef class ARKODE(Explicit_ODE):
                "nfcns_implicit": nfi,
                "nniters": nniters, "nnfails": nncfails, "nconvfails": nsolvefails, "nlus": nlinsetups,
                "njacs": njevals, "njacvecs": njvevals, "nfcnjacs": nfevalsLS, "nstatefcns": ngevals}
+        cur["nrhsfails"] = self.pData.nrhsfails
         last = self._last_counters
         for key, val in cur.items():
             prev = last.get(key, 0)
@@ -1227,6 +1274,24 @@ cdef class ARKODE(Explicit_ODE):
     def _get_linear_solver(self):
         return self.options["linear_solver"]
     linear_solver = property(_get_linear_solver, _set_linear_solver)
+
+    def _set_fail_factor(self, v):
+        v = float(v)
+        if not 0.0 < v < 1.0:
+            raise AssimuloException("fail_factor must be in (0, 1).")
+        self.options["fail_factor"] = v
+    def _get_fail_factor(self):
+        return self.options["fail_factor"]
+    fail_factor = property(_get_fail_factor, _set_fail_factor)
+
+    def _set_fail_max(self, n):
+        n = int(n)
+        if n < 0:
+            raise AssimuloException("fail_max must be non-negative.")
+        self.options["fail_max"] = n
+    def _get_fail_max(self):
+        return self.options["fail_max"]
+    fail_max = property(_get_fail_max, _set_fail_max)
 
     def _set_block_check(self, b):
         self.options["block_check"] = bool(b)

@@ -29,6 +29,11 @@
       block is a small dense LU with the coupling to the outside states substituted, and every
       setup checks the matrix against the declared structure, stopping the run with the
       offending entry when it does not hold. `nfcns_implicit` counts the implicit rhs calls.
+      A recoverable rhs failure at a directly evaluated stage (every explicit stage of an ERK
+      or ARK pair) is unrecoverable to ARKODE, which retries only the failures inside Newton;
+      the run is then restarted at the last accepted point with the step reduced by
+      `fail_factor` (0.25), up to `fail_max` (40) consecutive times, as Radau5ODE and TRBDF2
+      do; `nrhsfails` counts the refused points.
     * New solver `TRBDF2` (assimulo.solvers.TRBDF2): TR-BDF2, a second-order L-stable ESDIRK
       method (Hosea & Shampine 1996) implemented in C with a third-order error estimate filtered
       for stiffness, piecewise cubic Hermite dense output, a CVode-like Jacobian reuse policy,

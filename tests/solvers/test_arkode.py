@@ -638,3 +638,58 @@ class Test_ARKODE_imex:
         s.reset()
         t, y3 = s.simulate(1.0, 50)
         assert _reldev(y3, y1) < 1e-3
+
+
+class Test_ARKODE_refused_points:
+    """The rhs refusing trial points (an FMU whose property functions fail there): a
+    recoverable failure at an explicit stage is ARK_UNREC_RHSFUNC_ERR to ARKODE; the wrapper
+    restarts from the last accepted point with a smaller step (fail_factor, fail_max)."""
+
+    @staticmethod
+    def _problem(imex):
+        # y0' = -50 (y0 - 1) from 0.5: the solution stays within |y0 - 1| <= 0.5, but the explicit
+        # stage values of a step much larger than 2/50 leave that band and are refused
+        def refuse(y):
+            if abs(y[0] - 1.0) > 0.5:
+                raise ValueError("refused")
+        def f_raw(t, y):
+            return np.array([-50.0 * (y[0] - 1.0), -1000.0 * (y[1] - np.cos(t))])
+        def f(t, y):
+            refuse(y)
+            return f_raw(t, y)
+        mod = Explicit_Problem(f, [0.5, 0.0])
+        if imex:
+            # only the explicit part refuses: a refusal inside Newton (the implicit part) is
+            # ARKODE's own recoverable convergence failure, the explicit stage's is not
+            mod.rhs_implicit = lambda t, y: np.array([0.0, f_raw(t, y)[1]])
+            mod.rhs_explicit = lambda t, y: np.array([f(t, y)[0], 0.0])
+        return mod
+
+    def test_explicit_stage_refusal_is_retried(self):
+        mod = self._problem(imex=True)
+        s = ARKODE(mod); s.method = "imex"; s.rtol = 1e-6; s.atol = 1e-8; s.verbosity = 50
+        s.inith = 0.5                       # the first step's stage values leave the band and are refused
+        t, y = s.simulate(2.0, 100)
+        assert s.statistics["nrhsfails"] > 0
+        assert abs(y[-1, 1] - np.cos(2.0)) < 5e-3     # the stiff state at rtol 1e-6 under the ARK436 pair
+        assert abs(y[-1, 0] - 1.0) < 1e-4
+        # fail_max = 0: no retry, the error surfaces
+        s = ARKODE(self._problem(imex=True)); s.method = "imex"; s.inith = 0.5; s.fail_max = 0; s.verbosity = 50
+        with pytest.raises(ARKODEError, match="recoverable error"):
+            s.simulate(2.0, 100)
+
+    def test_explicit_method_refusal_is_retried(self):
+        mod = self._problem(imex=False)
+        s = ARKODE(mod); s.method = "explicit"; s.rtol = 1e-6; s.atol = 1e-8; s.inith = 0.5; s.verbosity = 50
+        t, y = s.simulate(0.5, 50)
+        assert s.statistics["nrhsfails"] > 0
+        assert abs(y[-1, 1] - np.cos(0.5)) < 5e-3
+
+    def test_options(self):
+        s = ARKODE(self._problem(imex=False))
+        with pytest.raises(AssimuloException):
+            s.fail_factor = 1.5
+        with pytest.raises(AssimuloException):
+            s.fail_max = -1
+        s.fail_factor = 0.5; s.fail_max = 3
+        assert s.fail_factor == 0.5 and s.fail_max == 3
